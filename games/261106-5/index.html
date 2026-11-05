@@ -629,7 +629,7 @@ function computeInvite(){
   if(rcv.open<1){return st.stops?'clock':'lever';}
   if(spring.state==='tray')return 'spring';
   if(!st.success)return 'lever';
-  if(!(st.h.near&&st.h.far))return 'spring';
+  if(!(st.h.near&&st.h.far)){const untried=st.h.near?'far':'near';return spring.recv===untried?'lever':'spring';}
   if(!(st.dir.L&&st.dir.R))return 'leverOpp';
   if(!(take.upper&&take.lower)){
     const need=take.upper?'lower':(take.lower?'upper':null);
