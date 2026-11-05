@@ -161,7 +161,10 @@ function computeLayout(){
     var wBx=c2b.x+2*r+18;
     var c3a={x:wBx-4,y:U(0,0.62).y};
     o.chute=[[c1a,c1b],[c2a,c2b],[c3a,o.F3]];
-    o.Wb=placeW(o,c1a,c1b);
+    o.hood={x:o.slot.x-r-14,y0:o.Re.y-2*r-36,y1:o.Re.y-6};
+    var s1h=function(x){return c1a.y+(x-c1a.x)*(c1b.y-c1a.y)/(c1b.x-c1a.x);};
+    var hwx=o.hood.x+r+24;
+    o.Wb={x:hwx,y:Math.min(o.Re.y+2*r+12,s1h(hwx)-2*r-6-o.Wr-10),r:o.Wr};
     o.walls=[[{x:wAx,y:c1b.y-50},{x:wAx,y:c2a.y+2}],[{x:wBx,y:c2b.y-50},{x:wBx,y:c3a.y+2}]];
     var exx=o.stopX+r+5,k3=(c3a.y-o.F3.y)/(c3a.x-o.F3.x);
     o.E2={x:exx,y:o.F3.y+(exx-o.F3.x)*k3-r-5};
@@ -177,7 +180,7 @@ function computeLayout(){
     o.chute=[[d1a,d1b],[d2a,o.F3]];
     o.walls=[[{x:wAx2,y:d1b.y-50},{x:wAx2,y:d2a.y+2}]];
     o.inner=[[U(0.97,-0.34),U(0.97,0.5)]];
-    o.Wb=placeW(o,d1a,d1b);
+    o.Wb=placeW(o,d1a,d1b);o.hood=null;
     var ex2=o.stopX-r-5,k4=(o.F3.y-d2a.y)/(o.F3.x-d2a.x);
     o.E2={x:ex2,y:o.F3.y+(ex2-o.F3.x)*k4-r-5};
     o.alcoveWallX=null;
@@ -239,9 +242,13 @@ function computeLayout(){
 
 // レールから落ちた玉が内側のベル W の左肩に当たる位置
 function placeW(o,sa,sb){
-  var r=BR,drop=o.Re.y-o.Rs.y,v=Math.sqrt(70*70+2*GRAV*Math.max(0,drop)*0.8);
-  var wy=o.Re.y+2*r+10,fall=Math.max(8,wy-o.Wr-(o.Re.y-r-4)),t=Math.sqrt(2*fall/GRAV);
-  var wx=o.Re.x-v*t+12;
+  var r=BR,wy=o.Re.y+2*r+10;
+  // レールを転がって落ちる玉を実際の物理で追い、W の高さでの x を求める
+  var b={x:o.Dp.x,y:o.Dp.y,vx:-70,vy:0},rail={ax:o.Rs.x,ay:o.Rs.y,bx:o.Re.x,by:o.Re.y,r:4,e:0.12},hx=o.Re.x-20;
+  for(var i=0;i<4000;i++){b.vy+=GRAV*SUB;b.x+=b.vx*SUB;b.y+=b.vy*SUB;collideSeg(b,rail);
+    var sp=Math.hypot(b.vx,b.vy);if(sp>820){b.vx*=820/sp;b.vy*=820/sp;}
+    if(b.y>=wy-o.Wr-r*0.6){hx=b.x;break;}}
+  var wx=hx+10;
   var s1=function(x){return sa.y+(x-sa.x)*(sb.y-sa.y)/(sb.x-sa.x);};
   wy=Math.min(wy,s1(wx)-2*r-6-o.Wr-10);
   return {x:wx,y:wy,r:o.Wr};
@@ -471,6 +478,7 @@ function buildColliders(){
   // レール
   sg(o.lx-30,o.y0-60,o.lx-30,o.Rs.y,4,0.2);
   sg(o.Rs.x,o.Rs.y,o.Re.x,o.Re.y,4,0.12,'rail');
+  if(o.hood)sg(o.hood.x,o.hood.y0,o.hood.x,o.hood.y1,4,0.2);
   // シュート
   for(var i=0;i<o.chute.length;i++){var c=o.chute[i];sg(c[0].x,c[0].y,c[1].x,c[1].y,4,0.12,'chute');}
   for(i=0;i<o.walls.length;i++){var w=o.walls[i];sg(w[0].x,w[0].y,w[1].x,w[1].y,4,0.2);}
@@ -1265,6 +1273,7 @@ function drawWorld(){
   drawBoard(o.poolR,o.poolBot-10,o.poolR,o.floorR-150,8,false);
   // レール
   drawBoard(o.Rs.x,o.Rs.y,o.Re.x,o.Re.y,8);
+  if(o.hood)drawBoard(o.hood.x,o.hood.y0,o.hood.x,o.hood.y1,7,false);
   drawBoard(o.lx-30,o.y0-60,o.lx-30,o.Rs.y,7,false);
   // 取り出し口の壁
   if(o.alcoveWallX!=null)drawBoard(o.alcoveWallX,o.F3.y-30,o.alcoveWallX,o.S0.y-4,7,false);
