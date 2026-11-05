@@ -654,8 +654,11 @@ function chooseInvite(){
   // ball waiting at a too-small hole: widen
   if(ball&&ball.st==='stopped'&&ball.win){var bw=wb(ball.win);var need=ball.r*2*1.1;return edgeInv(ball.win,(bw.hy*2<need)?'T':(ball.side>0?'R':'L'));}
   if(!S.D.hStrip){var hw=null;for(var i=0;i<winds.length;i++){if(!winds[i].round&&winds[i].hor){hw=winds[i];break;}}
-    if(hw)return edgeInv(hw.w,hw.d.x>0?'R':'L');return edgeInv(w0,UU(b0.cx)<0.5?'L':'R');}
-  if(!S.D.vGar){var tw=w0,ty=1e9;for(i=0;i<S.wins.length;i++){var bb=wb(S.wins[i]);if(bb.y0<ty&&!(L.floorY-bb.y1<2)){ty=bb.y0;tw=S.wins[i];}}return edgeInv(tw,'T');}
+    if(hw)return edgeInv(hw.w,hw.d.x>0?'R':'L');
+    var ow=orientWin(true,false);if(ow)return edgeInv(ow,UU(wb(ow).cx)<0.5?'L':'R');
+    var fs=freeSlit([3,4,1,5,2]);if(fs>=0)return slitInv(fs);}
+  if(!S.D.vGar){var vw=orientWin(false,true);if(vw)return edgeInv(vw,'T');
+    var fs2=freeSlit([3,4,5,1,0]);if(fs2>=0)return slitInv(fs2);}
   if(!S.D.ballPass){if(!winBySlit(2))return slitInv(2);}
   if(!S.D.gesture){if(!winBySlit(1))return slitInv(1);
     var ra=R[0],rb=R[1];if(ra.vis&&rb.vis){var wa=S.wins[ra.win],wbb=S.wins[rb.win];if(wa&&wbb&&wa!==wbb){return edgeInv(wbb,(Y(rb.v)>Y(ra.v))?'T':'B');}}
@@ -667,6 +670,9 @@ function chooseInvite(){
   // default: reshape most recent window
   var lw=S.wins[(Math.floor(NOW/8))%S.wins.length];var sides=['R','T','L','B'];return edgeInv(lw,sides[Math.floor(NOW/8)%4]);
 }
+function canOrient(b,hor){var r=b.hx/Math.max(1,b.hy);return hor?r>0.75:r<1.35;}
+function orientWin(hor,noFloor){var best=null,bs=-1;for(var i=0;i<S.wins.length;i++){var b=wb(S.wins[i]);if(noFloor&&L.floorY-b.y1<2)continue;if(!canOrient(b,hor))continue;var sc=hor?b.hx/b.hy:b.hy/b.hx;if(sc>bs){bs=sc;best=S.wins[i];}}return best;}
+function freeSlit(order){for(var i=0;i<order.length;i++)if(!winBySlit(order[i]))return order[i];return -1;}
 function spinInvite(){
   var ord=[0,1];if(spins[1].hits.length>spins[0].hits.length)ord=[1,0];
   for(var oi=0;oi<2;oi++){var si=ord[oi],sp=spins[si],sx=X(sp.u),sy=Y(sp.v);
@@ -674,9 +680,14 @@ function spinInvite(){
     for(var c=0;c<cand.length;c++){if(!winBySlit(cand[c]))return slitInv(cand[c]);}
     var hitW=sp.hits.map(function(h){return h.w;});
     for(var i=0;i<S.wins.length;i++){var w=S.wins[i];if(hitW.indexOf(w)>=0)continue;var b=wb(w);
-      if(Math.abs(b.cy-sy)<Math.max(b.hy,L.k*0.1)&&Math.abs(b.cx-sx)>b.hx)return edgeInv(w,sx>b.cx?'R':'L');
-      if(Math.abs(b.cx-sx)<Math.max(b.hx,L.k*0.1)&&Math.abs(b.cy-sy)>b.hy)return edgeInv(w,sy<b.cy?'T':'B');}
+      if(Math.abs(b.cy-sy)<Math.max(b.hy,L.k*0.1)&&Math.abs(b.cx-sx)>b.hx*0.5&&canOrient(b,true))return edgeInv(w,sx>b.cx?'R':'L');
+      if(Math.abs(b.cx-sx)<Math.max(b.hx,L.k*0.1)&&Math.abs(b.cy-sy)>b.hy*0.5&&canOrient(b,false))return edgeInv(w,sy<b.cy?'T':'B');}
   }
+  // relaxed: grow the nearest non-hitting window toward the spinner along the axis it can blow
+  for(oi=0;oi<2;oi++){var sp2=spins[ord[oi]],tx=X(sp2.u),ty=Y(sp2.v),hw2=sp2.hits.map(function(h){return h.w;}),bw=null,bd=1e9;
+    for(var j2=0;j2<S.wins.length;j2++){var w2=S.wins[j2];if(hw2.indexOf(w2)>=0)continue;var b2=wb(w2);var d2=Math.hypot(b2.cx-tx,b2.cy-ty);if(d2<bd){bd=d2;bw=w2;}}
+    if(bw){var bb=wb(bw),ddx=tx-bb.cx,ddy=ty-bb.cy;var hor=canOrient(bb,true)&&(Math.abs(ddx)>Math.abs(ddy)||!canOrient(bb,false));
+      return edgeInv(bw,hor?(ddx>0?'R':'L'):(ddy<0?'T':'B'));}}
   return null;
 }
 
