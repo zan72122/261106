@@ -572,8 +572,10 @@ function startWave(){
 }
 function startApplause(){
   stage='app';stageT=0;claps=[];
-  const traffic=[moveLog[0],moveLog[0]+moveLog[1],moveLog[1]];
-  for(const p of people)if(p.state==='sit'&&p.dest!==p.home)traffic[p.dest]+=0.5;
+  // the seat whose own listeners travelled the most starts the applause
+  const traffic=[0,0,0];
+  for(const p of people)for(let j=0;j<3;j++)if(j!==p.home)traffic[p.home]+=p.visits[j];
+  for(const p of people)if(p.state==='sit'&&p.dest!==p.home)traffic[p.home]+=0.5;
   const order=[0,1,2].sort((a,b)=>(traffic[b]-traffic[a])||(oi(a)-oi(b)));EV.app.push(order.join(''));
   let end=0;
   order.forEach((sl,k)=>{
