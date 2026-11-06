@@ -1,0 +1,1273 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta name="robots" content="noindex,nofollow">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#050818">
+<title>ぱんっ、ふわり！ふたりの手ぶくろと空とぶ舞台布</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#050818;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+canvas{position:fixed;left:0;top:0;display:block;touch-action:none;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none}
+#sa{position:fixed;left:0;top:0;visibility:hidden;pointer-events:none;padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left)}
+</style>
+
+<script src="../../gf-playlog.js" defer></script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+(function(){
+'use strict';
+// =====================================================================
+//  helpers
+// =====================================================================
+const TAU=Math.PI*2;
+const clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+const lerp=(a,b,t)=>a+(b-a)*t;
+const sstep=(a,b,x)=>{const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t);};
+const ease=t=>{t=clamp(t,0,1);return t*t*(3-2*t);};
+const hyp=Math.hypot;
+const rnd=Math.random;
+const appr=(v,t,r,dt)=>v+(t-v)*(1-Math.exp(-r*dt));
+const seg01=(t,a,b)=>clamp((t-a)/(b-a),0,1);
+
+// thermo palette: 6 cool base temperatures + heat (grips only) + white lines
+const PAL=['#050818','#111a4c','#25298c','#3652cc','#22a8de','#8cecff'];
+const HEAT=['#ff4a24','#ff9426','#ffdf45'];
+const WHITE='#ffffff';
+
+const cv=document.getElementById('c');
+const ctx=cv.getContext('2d');
+const saEl=document.getElementById('sa');
+
+// =====================================================================
+//  layout (world unit = character height h, y up from floor, x from center)
+// =====================================================================
+let W=0,H=0,DPR=1,h=100,floorY=0,cxS=0,Wh=1.2,L0=1.5,topH=3,battenY=2;
+const N=21,M=6,NP=N*M;
+let HC=0.95;
+let segRest=0.1,rowRest=0.19;
+const safe={t:0,r:0,b:0,l:0};
+function layout(){
+  W=Math.max(1,window.innerWidth); H=Math.max(1,window.innerHeight);
+  DPR=Math.min(2,window.devicePixelRatio||1);
+  cv.width=Math.round(W*DPR); cv.height=Math.round(H*DPR);
+  cv.style.width=W+'px'; cv.style.height=H+'px';
+  const cs=getComputedStyle(saEl);
+  safe.t=parseFloat(cs.paddingTop)||0; safe.r=parseFloat(cs.paddingRight)||0;
+  safe.b=parseFloat(cs.paddingBottom)||0; safe.l=parseFloat(cs.paddingLeft)||0;
+  const iw=W-safe.l-safe.r, top=safe.t, bot=H-safe.b;
+  const tall=(bot-top)/Math.max(1,iw);
+  floorY=bot-Math.max(34,(bot-top)*(tall>1.3?0.27:0.17));
+  h=Math.max(60,Math.min(iw*0.34,(floorY-top)*0.34));
+  cxS=safe.l+iw/2; Wh=(iw/2)/h;
+  L0=Math.min(2*Wh*0.62,3.0);
+  topH=(floorY-top)/h;
+  battenY=clamp(topH*0.5,1.7,2.4);
+  HC=clamp((topH-1.4)*0.4,0.9,1.3);
+  segRest=L0/(N-1); rowRest=HC/(M-1);
+  buildOrnaments();
+  if(phase==='greet') clothBackdrop(true);
+  clampAll();
+}
+const X=x=>cxS+x*h, Y=y=>floorY-y*h;
+function toWorld(e){return {x:(e.clientX-cxS)/h, y:(floorY-e.clientY)/h};}
+
+// =====================================================================
+//  audio (Web Audio synthesis only)
+// =====================================================================
+let AC=null,master=null,noiseBuf=null,audioOn=false;
+const BPM=100, BEAT=60/BPM, EIGHTH=BEAT/2;
+let accNext=0, accStep=0;
+function audioInit(){
+  if(AC){ if(AC.state==='suspended'&&!document.hidden) AC.resume().catch(()=>{}); return; }
+  try{
+    const C=window.AudioContext||window.webkitAudioContext; if(!C) return;
+    AC=new C();
+    const comp=AC.createDynamicsCompressor();
+    comp.threshold.value=-14; comp.ratio.value=4;
+    master=AC.createGain(); master.gain.value=0.55;
+    master.connect(comp); comp.connect(AC.destination);
+    noiseBuf=AC.createBuffer(1,AC.sampleRate*0.5|0,AC.sampleRate);
+    const d=noiseBuf.getChannelData(0); for(let i=0;i<d.length;i++) d[i]=Math.random()*2-1;
+    // silent unlock tick
+    const o=AC.createOscillator(), g=AC.createGain(); g.gain.value=0.0001; o.connect(g); g.connect(master); o.start(); o.stop(AC.currentTime+0.02);
+    accNext=AC.currentTime+0.1; audioOn=true;
+    if(AC.state==='suspended') AC.resume().catch(()=>{});
+  }catch(err){ AC=null; audioOn=false; }
+}
+function now(){return AC?AC.currentTime:0;}
+function envG(t,a,d,peak){
+  const g=AC.createGain(); g.gain.setValueAtTime(0.0001,t);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.0002,peak),t+a);
+  g.gain.exponentialRampToValueAtTime(0.0001,t+a+d); g.connect(master); return g;
+}
+function tone(f,t,dur,type,vol,f2){
+  if(!AC) return; t=Math.max(t,AC.currentTime);
+  const o=AC.createOscillator(); o.type=type||'sine'; o.frequency.setValueAtTime(f,t);
+  if(f2) o.frequency.exponentialRampToValueAtTime(f2,t+dur);
+  const g=envG(t,0.006,dur,vol); o.connect(g); o.start(t); o.stop(t+dur+0.05);
+}
+function noise(t,dur,freq,q,vol,f2){
+  if(!AC) return; t=Math.max(t,AC.currentTime);
+  const s=AC.createBufferSource(); s.buffer=noiseBuf;
+  const bp=AC.createBiquadFilter(); bp.type='bandpass'; bp.frequency.setValueAtTime(freq,t); bp.Q.value=q;
+  if(f2) bp.frequency.exponentialRampToValueAtTime(f2,t+dur);
+  const g=envG(t,0.003,dur,vol); s.connect(bp); bp.connect(g); s.start(t,Math.random()*0.3); s.stop(t+dur+0.05);
+}
+const SFX={
+  squash(){ if(!AC)return; const t=now(); tone(520,t,0.12,'sine',0.22,190); noise(t,0.05,900,1,0.08); },
+  clap(v){ if(!AC)return; const t=now(); v=v||1; noise(t,0.07,1600,0.9,0.5*v); noise(t+0.011,0.06,2300,1.1,0.35*v); noise(t+0.024,0.09,1200,0.8,0.25*v); },
+  chime(list,vol,gap){ if(!AC)return; const t=qNext(EIGHTH*0.5); list.forEach((f,i)=>{ bell(f,t+i*(gap||0.07),vol||0.16); }); },
+  boing(ten){ if(!AC)return; const t=now(); const f=180+ten*320; tone(f*1.6,t,0.22,'sine',0.16,f*0.8); tone(f*0.8,t+0.02,0.25,'triangle',0.07,f*1.2); },
+  creak(){ if(!AC)return; const t=now(); tone(95,t,0.16,'sawtooth',0.035,70); noise(t,0.12,500,4,0.05,350); },
+  whoosh(up,dur){ if(!AC)return; const t=now(); noise(t,dur||0.6,up?400:1500,0.7,0.22,up?2600:300); },
+  tick(){ if(!AC)return; const t=now(); tone(1400+rnd()*400,t,0.05,'sine',0.05); },
+  pop(){ if(!AC)return; const t=now(); tone(300,t,0.08,'sine',0.25,900); noise(t,0.05,3000,1,0.1); },
+  thud(){ if(!AC)return; const t=now(); tone(120,t,0.3,'sine',0.35,48); noise(t,0.12,300,1,0.15); },
+  rise(dur){ if(!AC)return; const t=now(); tone(330,t,dur,'triangle',0.08,990); },
+};
+function bell(f,t,vol){ if(!AC)return; tone(f,t,0.9,'sine',vol); tone(f*2.76,t,0.35,'sine',vol*0.3); tone(f*2,t,0.5,'triangle',vol*0.15); }
+function pluck(f,t,vol,bright){
+  if(!AC)return; t=Math.max(t,AC.currentTime);
+  const o=AC.createOscillator(); o.type=bright>0.6?'sawtooth':'triangle'; o.frequency.setValueAtTime(f,t);
+  const lp=AC.createBiquadFilter(); lp.type='lowpass'; lp.frequency.setValueAtTime(600+bright*3200,t); lp.frequency.exponentialRampToValueAtTime(300,t+0.4);
+  const g=envG(t,0.004,lerp(0.9,0.35,bright),vol); o.connect(lp); lp.connect(g); o.start(t); o.stop(t+1.1);
+}
+function bass(f,t,vol){ tone(f,t,0.45,'sine',vol,f*0.7); }
+function qNext(div){ if(!AC) return 0; const n=AC.currentTime; return Math.ceil((n+0.012)/div)*div; }
+const PENTA=[0,2,4,7,9,12,14,16,19,21,24];
+const mtof=m=>440*Math.pow(2,(m-69)/12);
+const CHORDS=[[48,55,64],[45,52,60],[41,48,57],[43,50,59]];
+function accompaniment(){
+  if(!AC||!audioOn) return;
+  const ahead=AC.currentTime+0.15;
+  if(accNext<AC.currentTime-0.2) accNext=qNext(EIGHTH);
+  while(accNext<ahead){
+    const st=accStep, t=accNext, bar=(st>>3)%4, ch=CHORDS[bar], pos=st%8;
+    const lv=accLevel;
+    if(lv>0.25 && pos%4===0) bass(mtof(ch[0]-12),t,0.18*Math.min(1,lv));
+    if(lv>1.1 && pos%2===1) noise(t,0.04,6000,1.5,0.05);
+    if(lv>1.9 && (pos===0||pos===3||pos===6)) bell(mtof(ch[(pos/3|0)%3]+12),t,0.05);
+    if(lv>2.8 && pos===4) bell(mtof(ch[2]+19),t,0.045);
+    if(dance>0 && pos%2===0) bell(mtof(ch[pos/2%3]+24),t,0.04);
+    accNext+=EIGHTH; accStep++;
+  }
+}
+
+// =====================================================================
+//  state
+// =====================================================================
+let phase='greet', pt=0, T=0, cycle=0;
+const disc={d1:false,d2:false,d3:false,d4:false,d5:false,d6:false,open:false};
+const sub={dragCloth:0,hidSeen:false,revealSide:false,rehide:false,roof:false,tilt:false,flutter:false,wave:false,lowWave:false,layer:false,shadeIn:false,shadeOut:false,sitSeen:false,swapDone:false};
+const LOG=[];
+function note(k,v){ LOG.push({t:+T.toFixed(2),k:k,v:v}); if(LOG.length>300) LOG.shift(); }
+const mem={lastRester:-1,lastShakeLow:false,lastShakeAmp:0.2,roofTilt:0,swapOrder:[]};
+
+function makeChar(id){return {id:id,x:0,tx:0,crouch:0,squat:0,squatV:0,hop:0,hopV:0,sit:0,lean:0,face:'smile',gx:0,gy:1,hand:{x:0,y:0.6},off:{x:0,y:0.35},walk:0,dir:1,beckon:0,bow:0,armUp:0,blink:0,blinkT:2+rnd()*3,wob:0,holds:true,glove:1,sweat:0,cheer:0};}
+const CH=[makeChar(0),makeChar(1)]; // 0 = player-side stagehand, 1 = partner
+let sup=0, res=1; // supporter (holds draggable ring) / rester
+let chairOpen=0, chairOpenT=0, chairWob=0, spot=0, audience=0, shadeOver=false;
+const gloveP={x:-0.25,y:0.5,rx:-0.25,ry:0.5,sq:0,heat:0,vx:0,vy:0};
+const gloveB={x:0.3,y:1.05,rx:0.3,ry:1.05,sq:0,heat:0};
+const ringL={x:-0.22,y:0.78,hx:-0.22,hy:0.78,r:0,sq:0,sqV:0,heat:0.5,grow:0,giant:0,gcx:0,gcy:0,planted:false};
+const ringR={x:0.22,y:0.78,by:0,bt:9,bamp:0,r:0,sq:0,sqV:0,heat:0.5};
+let farX=0,farY=0,bigArmed=false;
+let curtain=true, chairHidT=0, chairLastHid=-9, chairHidden=false;
+let lift=0, liftOv=-1, tension=0, slack=1, roofTilt=0;
+let accLevel=0, energy=0, dance=0, lastStroke=-9, strokeDir=0, strokeExt=0, lastHandY=0, handVY=0, echoPending=0;
+let overpull=0, overT=0, creakT=0, prevLx=0, dragDist=0;
+const events=[]; // timed game events {at, fn}
+function later(sec,fn){events.push({at:T+sec,fn:fn});}
+
+// =====================================================================
+//  cloth (kinematic top row with 1D wave equation + verlet hanging rows)
+// =====================================================================
+const cx_=new Float32Array(NP), cy_=new Float32Array(NP), ox_=new Float32Array(NP), oy_=new Float32Array(NP);
+const ty=new Float32Array(N), tv=new Float32Array(N), crease=new Float32Array(N), tLine=new Float32Array(N);
+const endL={x:0,y:0}, endR={x:0,y:0};
+function clothBackdrop(reset){
+  endL.x=-L0/2; endL.y=battenY; endR.x=L0/2; endR.y=battenY;
+  for(let i=0;i<N;i++){ ty[i]=battenY+crease[i]*0.04; tv[i]=0; }
+  if(reset){
+    for(let r=0;r<M;r++) for(let i=0;i<N;i++){ const k=r*N+i; cx_[k]=ox_[k]=-L0/2+i*segRest; cy_[k]=oy_[k]=battenY-r*rowRest; }
+  }
+}
+function clothStep(dt){
+  const ax=endL.x, ay=endL.y, bx=endR.x, by=endR.y;
+  const dx=bx-ax, dy=by-ay, d=Math.max(0.01,hyp(dx,dy));
+  tension=clamp(d/L0,0,1.1); slack=clamp(1-d/L0,0,1);
+  const sagD=Math.min(0.2,Math.sqrt(Math.max(0,L0*L0-d*d))*0.2)*(1-lift*0.7);
+  const Tt=lerp(1.2,0.42,clamp(tension,0,1)), cc=(N-1)/Tt, K=cc*cc;
+  const damp=lerp(2.2,3.2,clamp(tension,0,1))+(phase==='join'?6:0);
+  const curv=8*sagD/((N-1)*(N-1));
+  const steps=Math.max(1,Math.ceil(dt*130)), sdt=dt/steps;
+  for(let s=0;s<steps;s++){
+    ty[0]=ay; ty[N-1]=by;
+    for(let i=1;i<N-1;i++){
+      const kf=1-0.32*Math.abs(crease[i]);
+      const lap=ty[i-1]-2*ty[i]+ty[i+1]-curv-0.04*(crease[i-1]-2*crease[i]+crease[i+1]);
+      tv[i]+=(K*kf*lap-damp*tv[i])*sdt;
+    }
+    for(let i=1;i<N-1;i++){ ty[i]+=tv[i]*sdt; if(ty[i]<0.03){ty[i]=0.03; tv[i]*=-0.3;} }
+  }
+  for(let i=0;i<N;i++){ const t=i/(N-1); tLine[i]=lerp(ay,by,t); cx_[i]=lerp(ax,bx,t); cy_[i]=ty[i]; ox_[i]=cx_[i]; oy_[i]=cy_[i]; }
+  // lower rows
+  const G=9, nx=-dy/d, ny=dx/d, lf=lift, midX=(ax+bx)/2;
+  const dt2=dt*dt;
+  for(let r=1;r<M;r++){
+    const fr=r/(M-1);
+    for(let i=0;i<N;i++){
+      const k=r*N+i;
+      const vx=(cx_[k]-ox_[k])*0.975, vy=(cy_[k]-oy_[k])*0.975;
+      ox_[k]=cx_[k]; oy_[k]=cy_[k];
+      let fx=(cx_[i]-cx_[k])*6*(1-lf)*(0.4+slack), fy=-G;
+      if(lf>0.001){
+        const L=G*1.8*lf; fx+=nx*L+(midX-cx_[k])*1.3*lf*fr; fy+=ny*L;
+        fx+=Math.sin(T*4.3+i*0.35+r*0.9)*0.7*lf*fr; fy+=Math.cos(T*3.7+i*0.4)*0.6*lf*fr;
+      }
+      cx_[k]+=vx+fx*dt2; cy_[k]+=vy+fy*dt2;
+    }
+  }
+  const diag=Math.sqrt(segRest*segRest+rowRest*rowRest);
+  for(let it=0;it<5;it++){
+    for(let r=1;r<M;r++){
+      for(let i=0;i<N;i++){
+        const a=(r-1)*N+i, b=r*N+i;
+        link(a,b,rowRest,r-1===0,0);
+        if(i<N-1){ link(b,b+1,segRest,false,1); link(a,b+1,diag,r-1===0,1); link(a+1,b,diag,r-1===0,1); }
+      }
+    }
+    for(let k=N;k<NP;k++){ if(cy_[k]<0.015){ cy_[k]=0.015; ox_[k]=lerp(ox_[k],cx_[k],0.4);} }
+  }
+}
+function link(a,b,rest,aFixed,mode){
+  const dx=cx_[b]-cx_[a], dy=cy_[b]-cy_[a], d=Math.sqrt(dx*dx+dy*dy)||1e-6;
+  if(mode===1){ if(d<=rest*1.02 && d>=rest*0.1) return; }
+  const diff=(d-(mode===1&&d<rest*0.1?rest*0.1:rest))/d;
+  if(aFixed){ cx_[b]-=dx*diff; cy_[b]-=dy*diff; }
+  else { cx_[a]+=dx*diff*0.5; cy_[a]+=dy*diff*0.5; cx_[b]-=dx*diff*0.5; cy_[b]-=dy*diff*0.5; }
+}
+function clothYAtX(x,row){ // interpolate row y at world x (by top column param)
+  const ax=endL.x,bx=endR.x; if(bx-ax<0.01) return null;
+  const t=(x-ax)/(bx-ax); if(t<0||t>1) return null;
+  const f=t*(N-1), i=Math.min(N-2,f|0), u=f-i;
+  return lerp(cy_[row*N+i],cy_[row*N+i+1],u);
+}
+function computeChairHidden(){
+  if(chairOpen>0.5) return false;
+  if(endL.x>-0.08||endR.x<0.08) return false;
+  const top=clothYAtX(0,0), bot=clothYAtX(0,M-1); if(top===null) return false;
+  return top>0.45 && bot<0.3 && lift<0.5;
+}
+
+// =====================================================================
+//  ornaments (paper decorations)
+// =====================================================================
+let ORN=[];
+function buildOrnaments(){
+  const K=clamp(Math.round(Wh*2.6),4,8), old=ORN;
+  ORN=[];
+  const span=Wh*0.86, room=Math.max(0.3,topH-battenY-0.15);
+  for(let k=0;k<K;k++){
+    const o=old[k]||{a:0,w:0,hop:0,hv:0,kind:k%3};
+    o.x=-span+k*(2*span/(K-1));
+    o.len=clamp(room*(0.45+0.35*(((k*7)%5)/4)),0.25,1.3);
+    o.kind=k%3; ORN.push(o);
+  }
+}
+function ornStep(dt){
+  const bp=accNext>0?((T/BEAT)%1):0;
+  for(let k=0;k<ORN.length;k++){
+    const o=ORN[k];
+    let f=-14*o.a-1.6*o.w;
+    f+=lift*(Math.sin(T*3.1+k*1.9)*4+Math.sin(T*7.3+k)*2);
+    if(dance>0) f+=Math.sin(T*TAU/BEAT+k*0.7)*16*Math.min(1,dance);
+    o.w+=f*dt; o.a+=o.w*dt; if(Math.abs(o.a)>0.6){ o.a=clamp(o.a,-0.6,0.6); o.w*=-0.3; }
+    o.hv+=(-60*o.hop-7*o.hv)*dt; o.hop+=o.hv*dt;
+    if(dance>0 && Math.abs(Math.sin(T*TAU/BEAT*0.5+k))>0.995) o.hv+=0.8;
+  }
+}
+function kickOrn(s){ for(const o of ORN){ o.w+=(rnd()-0.5)*s*4; o.hv+=s*0.6*rnd(); } }
+
+// =====================================================================
+//  particles (capped)
+// =====================================================================
+const PMAX=110, parts=[];
+function emit(x,y,n,kind,sp){
+  for(let i=0;i<n;i++){
+    if(parts.length>=PMAX) parts.shift();
+    const a=rnd()*TAU, v=(sp||1)*(0.4+rnd()*1.2);
+    parts.push({x:x,y:y,vx:Math.cos(a)*v,vy:Math.sin(a)*v+(kind==='conf'?1.5:0.3),life:kind==='conf'?2.4:0.7+rnd()*0.4,t:0,kind:kind,c:(rnd()*3)|0,s:0.02+rnd()*0.03,rot:rnd()*TAU});
+  }
+}
+function partStep(dt){
+  for(let i=parts.length-1;i>=0;i--){
+    const p=parts[i]; p.t+=dt;
+    if(p.t>=p.life){ parts.splice(i,1); continue; }
+    if(p.kind==='conf'){ p.vy-=2.2*dt; p.vx*=0.985; p.vy*=0.985; p.vy=Math.max(p.vy,-0.7); p.rot+=dt*5; p.x+=Math.sin(p.t*4+p.rot)*0.004; }
+    else if(p.kind==='heat'){ p.vy+=0.6*dt; p.vx*=0.93; p.vy*=0.93; }
+    else { p.vx*=0.95; p.vy*=0.95; }
+    p.x+=p.vx*dt; p.y+=p.vy*dt;
+  }
+}
+
+// =====================================================================
+//  input (one active pointer only)
+// =====================================================================
+let act=null, idleT=0, lastTouch=-9;
+const demoShown={}; let demo={on:false,t:0,goal:'',from:{x:0,y:0},path:null}, cueT=0, cue={t:9,dx:0,dy:0};
+function grabTarget(w){
+  const R=Math.max(0.36, 46/h);
+  if(phase==='greet'){
+    if(hyp(w.x-gloveP.x,w.y-gloveP.y)<R) return 'glove';
+  } else if(phase==='play'){
+    if(hyp(w.x-ringL.hx,w.y-ringL.hy)<R+0.04) return 'ring';
+  }
+  return null;
+}
+function onDown(e){
+  e.preventDefault();
+  if(perf.down<0) perf.down=performance.now();
+  audioInit();
+  idleT=0; lastTouch=T; demo.on=false;
+  if(act) return; // extra fingers ignored
+  const w=toWorld(e), tg=grabTarget(w);
+  if(tg){
+    act={id:e.pointerId,tg:tg,ox:0,oy:0,fx:w.x,fy:w.y};
+    if(tg==='glove'){ act.ox=gloveP.x-w.x; act.oy=gloveP.y-w.y; gloveP.sq=1; gloveP.heat=1; SFX.squash(); emit(gloveP.x,gloveP.y,8,'heat',0.8); CH[0].face='laugh'; CH[1].face='laugh'; }
+    else { act.ox=ringL.hx-w.x; act.oy=ringL.hy-w.y; ringL.sq=1; ringL.heat=1; SFX.squash(); emit(ringL.hx,ringL.hy,6,'heat',0.7); }
+    act.fx=w.x+act.ox; act.fy=w.y+act.oy;
+    try{ cv.setPointerCapture(e.pointerId); }catch(err){}
+  } else wobbleAt(w);
+}
+function onMove(e){
+  if(!act||e.pointerId!==act.id) return;
+  e.preventDefault(); idleT=0;
+  const w=toWorld(e); act.fx=w.x+act.ox; act.fy=w.y+act.oy;
+}
+function onUp(e){
+  if(!act||e.pointerId!==act.id) return;
+  release(true);
+}
+function release(sound){
+  if(!act) return;
+  const tg=act.tg; act=null;
+  if(tg==='ring'){ ringL.sqV=-5; if(sound) SFX.boing(tension); ringL.grow=Math.min(ringL.grow,0.99); }
+  if(tg==='glove'){ gloveP.vx=0; gloveP.vy=0; if(sound&&phase==='greet') SFX.boing(0.3); }
+}
+cv.addEventListener('pointerdown',onDown,{passive:false});
+cv.addEventListener('pointermove',onMove,{passive:false});
+cv.addEventListener('pointerup',onUp,{passive:false});
+cv.addEventListener('pointercancel',e=>{ if(act&&e.pointerId===act.id) release(false); },{passive:false});
+cv.addEventListener('lostpointercapture',e=>{ if(act&&e.pointerId===act.id) release(false); });
+window.addEventListener('blur',()=>release(false));
+['touchstart','touchmove','touchend','gesturestart','gesturechange','dblclick'].forEach(ev=>document.addEventListener(ev,e=>{ if(e.cancelable) e.preventDefault(); },{passive:false}));
+document.addEventListener('contextmenu',e=>e.preventDefault());
+
+function wobbleAt(w){
+  // unrelated touches: only a small wiggle of the nearest thing
+  SFX.tick();
+  let best=null, bd=0.6;
+  for(const o of ORN){ const oy=topH-o.len; const d=hyp(w.x-o.x,w.y-oy); if(d<bd){bd=d;best=o;} }
+  if(best){ best.w+=(w.x<best.x?1:-1)*1.2; return; }
+  if(hyp(w.x,w.y-0.3)<0.4){ chairWob=1; return; }
+  for(const c of CH){ if(hyp(w.x-c.x,w.y-0.6)<0.45){ c.wob=1; c.blink=0.15; return; } }
+  // cloth nearby: tiny ripple
+  for(let i=1;i<N-1;i++){ if(Math.abs(cx_[i]-w.x)<0.2 && Math.abs(w.y-cy_[i])<0.7){ tv[i]+=0.5; return; } }
+}
+
+// =====================================================================
+//  goals / hints (one lure at a time)
+// =====================================================================
+function goal(){
+  if(phase==='greet') return 'hf';
+  if(phase!=='play') return '';
+  if(!chairOpen){
+    if(!disc.d2) return curtain?'side':'close';
+    if(!disc.d3) return 'far';
+    if(!disc.d4) return 'shake';
+    if(!curtain) return 'close';
+    return chairHidden?'lift':'cover';
+  }
+  if(!(sub.shadeIn)) return 'far';
+  if(!disc.d4) return 'shake';
+  if(sub.swapDone) return 'open';
+  return lift>0.6&&ringL.hy>1.0?'pullin':'farup';
+}
+function goalDir(g){
+  switch(g){
+    case 'hf': return {x:gloveB.x-gloveP.x,y:gloveB.y-gloveP.y};
+    case 'side': return {x:-1,y:0};
+    case 'close': return {x:1,y:0};
+    case 'far': return {x:-1,y:0.15};
+    case 'shake': return {x:0,y:1};
+    case 'lift': return {x:0,y:1};
+    case 'cover': return {x:((endL.x+endR.x)/2>0?-1:1),y:0};
+    case 'farup': return {x:-0.7,y:0.7};
+    case 'pullin': return {x:1,y:0};
+    case 'open': return {x:-1,y:-0.2};
+  }
+  return {x:0,y:0};
+}
+function demoPath(g){
+  const s=phase==='greet'?{x:gloveP.x,y:gloveP.y}:{x:ringL.hx,y:ringL.hy};
+  const P=[s]; const minX=-Wh+0.52;
+  switch(g){
+    case 'hf': P.push({x:gloveB.x,y:gloveB.y}); break;
+    case 'side': P.push({x:s.x-0.55,y:s.y},{x:s.x,y:s.y}); break;
+    case 'close': P.push({x:Math.min(s.x+0.8,ringR.x-0.35),y:s.y}); break;
+    case 'far': P.push({x:minX,y:s.y+0.1}); break;
+    case 'shake': P.push({x:s.x,y:s.y+0.35},{x:s.x,y:s.y-0.3},{x:s.x,y:s.y+0.35},{x:s.x,y:s.y-0.3}); break;
+    case 'lift': P.push({x:s.x,y:Math.min(1.45,s.y+0.6)}); break;
+    case 'cover': { const c=(endL.x+endR.x)/2; P.push({x:s.x-c,y:s.y}); break; }
+    case 'farup': P.push({x:minX,y:1.35}); break;
+    case 'pullin': P.push({x:s.x+0.7,y:s.y}); break;
+    case 'open': P.push({x:minX-0.2,y:s.y-0.2}); break;
+  }
+  return P;
+}
+function hintStep(dt){
+  const g=goal();
+  if(!act) idleT+=dt;
+  if(!g){ demo.on=false; return; }
+  if(idleT>4 && !demo.on && !demoShown[g+(phase==='greet'?cycle:'')]){
+    demoShown[g+(phase==='greet'?cycle:'')]=true;
+    demo={on:true,t:0,goal:g,path:demoPath(g)};
+  }
+  if(demo.on){ demo.t+=dt; if(demo.t>2.8) demo.on=false; }
+  // afterwards: small environmental lures
+  cue.t+=dt;
+  if(idleT>4 && !demo.on){
+    cueT+=dt;
+    if(cueT>3.2){ cueT=0; const d=goalDir(g), l=hyp(d.x,d.y)||1; cue={t:0,dx:d.x/l,dy:d.y/l}; const p=CH[res]; p.hopV+=0.9; }
+  } else cueT=0;
+}
+
+// =====================================================================
+//  characters
+// =====================================================================
+function charStep(c,dt){
+  const dx=c.tx-c.x; const sp=clamp(dx*7,-2.8,2.8);
+  c.x+=sp*dt; c.walk+=Math.abs(sp)*dt*9;
+  if(Math.abs(sp)<0.05) c.walk=appr(c.walk,Math.round(c.walk/Math.PI)*Math.PI,8,dt);
+  c.squatV+=(-90*c.squat-11*c.squatV)*dt; c.squat+=c.squatV*dt;
+  c.hopV+=(-120*c.hop-12*c.hopV)*dt; c.hop+=c.hopV*dt; c.hop=Math.max(-0.05,c.hop);
+  c.wob=appr(c.wob,0,4,dt); c.beckon=appr(c.beckon,0,1.2,dt);
+  c.blinkT-=dt; if(c.blinkT<0){c.blink=0.13; c.blinkT=2+rnd()*3.5;} c.blink=Math.max(0,c.blink-dt);
+}
+function pose(c){
+  const sq=clamp(c.crouch*0.17+c.squat*0.16,-0.05,0.26);
+  const hipY=lerp(0.46-sq,0.34,c.sit)+Math.max(0,c.hop);
+  const lean=c.lean;
+  const bowx=c.bow*c.dir*0.1;
+  const hipX=c.x;
+  const shX=c.x+lean*0.07+bowx, shY=hipY+0.27-c.bow*0.07;
+  const hdX=shX+lean*0.04+bowx*0.6, hdY=shY+0.17-c.bow*0.05;
+  return {hipX:hipX,hipY:hipY,shX:shX,shY:shY,hdX:hdX,hdY:hdY};
+}
+
+// =====================================================================
+//  phases
+// =====================================================================
+function setPhase(p){ phase=p; pt=0; note('phase',p); }
+function startCycle(first){
+  setPhase('greet');
+  chairOpen=0; spot=0; audience=0; lift=0; liftOv=-1;
+  sup=0; res=1; overpull=0; overT=0; ringL.r=0; ringR.r=0; ringL.giant=0; ringL.grow=0; ringL.planted=false; bigArmed=false;
+  const energetic=mem.lastRester===1;
+  CH[0].tx=CH[0].x=first?-0.5:CH[0].x; CH[1].tx=CH[1].x=first?0.5:CH[1].x;
+  CH[0].tx=-0.5; CH[1].tx=0.5;
+  for(const c of CH){ c.sit=0; c.glove=1; c.holds=true; c.bow=0; c.armUp=0; }
+  CH[0].dir=1; CH[1].dir=-1;
+  gloveP.rx=-0.24; gloveP.ry=0.5; if(first){gloveP.x=gloveP.rx; gloveP.y=gloveP.ry;}
+  gloveB.rx=0.3; gloveB.ry=energetic?1.18:1.0; gloveB.x=gloveB.rx; gloveB.y=gloveB.ry;
+  if(first) clothBackdrop(true);
+}
+function highFive(){
+  note('highfive',cycle);
+  release(false);
+  setPhase('join');
+  const cxp=(gloveP.x+gloveB.x)/2, cyp=(gloveP.y+gloveB.y)/2;
+  gloveP.x=cxp-0.05; gloveB.x=cxp+0.05; gloveP.y=gloveB.y=cyp;
+  gloveP.sq=1.4; gloveB.sq=1.4; gloveP.heat=1; gloveB.heat=1;
+  SFX.clap(1.2); SFX.chime([mtof(72),mtof(76),mtof(79)],0.14,0.06);
+  emit(cxp,cyp,26,'heat',1.6);
+  CH[0].face='laugh'; CH[1].face='laugh'; CH[0].hopV+=1.4; CH[1].hopV+=1.4;
+  join0={x:cxp,y:cyp}; endL0={x:endL.x,y:endL.y}; endR0={x:endR.x,y:endR.y};
+  energy=0; accLevel=Math.max(accLevel,0.5);
+}
+let join0={x:0,y:0}, endL0={x:0,y:0}, endR0={x:0,y:0};
+
+function update(dt){
+  T+=dt; pt+=dt;
+  for(let i=events.length-1;i>=0;i--){ if(events[i].at<=T){ const ev=events[i]; events.splice(i,1); ev.fn(); } }
+  hintStep(dt);
+  for(const c of CH){ c.off.x=c.x-c.dir*0.17; c.off.y=0.32+c.sit*0.08; }
+  if(phase==='greet') updGreet(dt);
+  else if(phase==='join') updJoin(dt);
+  else if(phase==='play') updPlay(dt);
+  else if(phase==='reveal') updReveal(dt);
+  else if(phase==='swap') updSwap(dt);
+  else if(phase==='finale') updFinale(dt);
+  // shared
+  lift=liftOv>=0?appr(lift,liftOv,3,dt):lift;
+  clothStep(dt);
+  for(const c of CH) charStep(c,dt);
+  ornStep(dt); partStep(dt);
+  accLevel=Math.max(0,accLevel-dt*0.07); energy=Math.max(0,energy-dt*0.55); dance=Math.max(0,dance-dt);
+  ringL.sqV+=(-200*ringL.sq-14*ringL.sqV)*dt; ringL.sq+=ringL.sqV*dt;
+  ringR.sqV+=(-200*ringR.sq-14*ringR.sqV)*dt; ringR.sq+=ringR.sqV*dt;
+  gloveP.sq=appr(gloveP.sq,0,7,dt); gloveB.sq=appr(gloveB.sq,0,7,dt);
+  gloveP.heat=appr(gloveP.heat,0,1.2,dt); gloveB.heat=appr(gloveB.heat,0,1.2,dt);
+  ringL.heat=appr(ringL.heat,act?0.95:0.45,act?6:0.8,dt); ringR.heat=appr(ringR.heat,0.45,0.8,dt);
+  chairWob=appr(chairWob,0,4,dt);
+  if(audioOn) accompaniment();
+}
+
+function updGreet(dt){
+  const P=CH[0], B=CH[1];
+  if(act&&act.tg==='glove'){
+    gloveP.x=clamp(act.fx,-Wh+0.1,Wh-0.1); gloveP.y=clamp(act.fy,0.15,1.5);
+    // magnet: partner leans in when close
+    const d=hyp(gloveB.x-gloveP.x,gloveB.y-gloveP.y);
+    const pull=sstep(0.8,0.3,d);
+    gloveB.x=lerp(gloveB.rx,gloveP.x+0.06,pull*0.35); gloveB.y=lerp(gloveB.ry,gloveP.y,pull*0.35);
+    if(d<0.27){ highFive(); return; }
+    if(rnd()<dt*8) emit(gloveP.x,gloveP.y,1,'heat',0.3);
+  } else {
+    gloveP.x=appr(gloveP.x,gloveP.rx,7,dt); gloveP.y=appr(gloveP.y,gloveP.ry+Math.sin(T*3)*0.025,7,dt);
+    const wag=Math.sin(T*5)*0.03*(idleT>1.5?1:0.3);
+    gloveB.x=appr(gloveB.x,gloveB.rx+wag,6,dt); gloveB.y=appr(gloveB.y,gloveB.ry+Math.abs(Math.sin(T*2.5))*0.03,6,dt);
+  }
+  P.tx=clamp(gloveP.x-0.32,-Wh+0.15,0.1); B.tx=0.5;
+  P.hand.x=gloveP.x; P.hand.y=gloveP.y; B.hand.x=gloveB.x; B.hand.y=gloveB.y;
+  P.off.x=P.x-0.17; P.off.y=0.3; B.off.x=B.x+0.17; B.off.y=0.3;
+  P.crouch=sstep(0.45,0.15,gloveP.y); B.crouch=0; P.lean=0; B.lean=-0.2;
+  P.gx=gloveB.x; P.gy=gloveB.y; B.gx=gloveP.x; B.gy=gloveP.y;
+  if(!act){ P.face='smile'; B.face=idleT>2?'laugh':'smile'; }
+  endL.x=-L0/2; endL.y=battenY; endR.x=L0/2; endR.y=battenY;
+}
+function updJoin(dt){
+  const P=CH[0], B=CH[1];
+  const t=pt;
+  const s=ease(seg01(t,0.28,1.15));
+  const pl={x:-0.24,y:0.8}, pr={x:0.24,y:0.8};
+  gloveP.x=lerp(join0.x-0.05,pl.x,s); gloveP.y=lerp(join0.y,pl.y,s);
+  gloveB.x=lerp(join0.x+0.05,pr.x,s); gloveB.y=lerp(join0.y,pr.y,s);
+  ringL.hx=ringL.x=gloveP.x; ringL.hy=ringL.y=gloveP.y; ringR.x=gloveB.x; ringR.y=gloveB.y;
+  ringL.r=ringR.r=0.075*ease(seg01(t,0.2,0.6));
+  P.glove=B.glove=1-ease(seg01(t,0.2,0.5));
+  const c=ease(seg01(t,0.25,1.2)), arc=Math.sin(Math.PI*c)*0.5;
+  endL.x=lerp(endL0.x,ringL.x,c); endL.y=lerp(endL0.y,ringL.y,c)+arc;
+  endR.x=lerp(endR0.x,ringR.x,c); endR.y=lerp(endR0.y,ringR.y,c)+arc;
+  if(t<0.3 && rnd()<0.5) emit(join0.x,join0.y,1,'heat',1.2);
+  if(t>0.3 && t-dt<=0.3) SFX.whoosh(false,0.8);
+  P.tx=gloveP.x-0.32; B.tx=gloveB.x+0.3;
+  P.hand.x=gloveP.x; P.hand.y=gloveP.y; B.hand.x=gloveB.x; B.hand.y=gloveB.y;
+  P.gx=B.x; P.gy=0.9; B.gx=P.x; B.gy=0.9;
+  if(t>1.25){ setPhase('play'); disc.d1=disc.d1||false; sub.dragCloth=0; prevLx=ringL.hx; curtain=true; P.face='smile'; B.face='smile'; ringL.heat=1; ringR.heat=1; }
+}
+
+// ---------- main play ----------
+function updPlay(dt){
+  const S=CH[sup], Rr=CH[res];
+  const minX=-Wh+0.52;
+  // ---- move the supporter's ring (draggable) ----
+  let fx=ringL.hx, fy=ringL.hy;
+  if(act&&act.tg==='ring'){ fx=act.fx; fy=act.fy; }
+  const rawX=fx, rawY=fy;
+  fx=clamp(fx,minX,ringR.x-0.26); fy=clamp(fy,0.18,1.5);
+  // tension limit (rubber)
+  let edgeOver=Math.max(0,minX-rawX);
+  let ddx=fx-ringR.x, ddy=fy-ringR.y, dd=hyp(ddx,ddy), maxD=L0*1.04, rub=0;
+  if(dd>maxD){ rub=dd-maxD; const k=(maxD+rub*0.12)/dd; fx=ringR.x+ddx*k; fy=ringR.y+ddy*k; fx=Math.max(fx,minX); }
+  overpull=act?Math.max(rub,edgeOver*(tension>0.75?1:0.45)):0;
+  const pvx=fx-ringL.hx, pvy=fy-ringL.hy;
+  if(act){ dragDist+=hyp(pvx,pvy); }
+  ringL.hx=fx; ringL.hy=fy;
+  // vertical velocity for shake strokes
+  handVY=appr(handVY,pvy/Math.max(dt,1e-3),18,dt);
+  // ---- big-roof pull-in => giant ring (after chair) ----
+  const bigOK=chairOpen>0.9 && lift>0.6 && ringL.hy>1.0 && !!act;
+  if(bigOK && !bigArmed){ bigArmed=true; farX=ringL.hx; farY=ringL.hy; }
+  if(bigArmed){
+    if(act && ringL.hx<farX){ farX=ringL.hx; farY=ringL.hy; }
+    const inward=ringL.hx-farX-0.03;
+    const tgt=act?clamp(inward/0.38,0,1):0;
+    ringL.grow=appr(ringL.grow,tgt,act?12:6,dt);
+    if(!act && ringL.grow<0.02){ bigArmed=false; ringL.grow=0; }
+    if(ringL.grow>0.03 && Math.floor(ringL.grow*8)!==Math.floor((ringL.grow-0.02)*8) && rnd()<0.3) SFX.tick();
+    if(ringL.grow>=0.97 && act){ startSwap(); return; }
+  }
+  if(ringL.grow>0.01){ ringL.x=appr(ringL.x,farX,20,dt); ringL.y=appr(ringL.y,farY,20,dt); }
+  else { ringL.x=ringL.hx; ringL.y=ringL.hy; }
+  // ---- partner side ----
+  if(!chairOpen){
+    const dLx=ringL.hx-prevLx;
+    const g=ringR.x-ringL.hx;
+    const enterC=g<L0*0.42, exitC=g>L0*0.52;
+    if(!curtain && enterC){ curtain=true; ringR.x=Math.max(ringL.hx+0.28,ringR.x-Math.min(0.15,g*0.15)); note('curtain',1); }
+    else if(curtain && exitC){ curtain=false; }
+    const Rmax=Wh-0.3, Rmin=-0.2;
+    if(curtain){ ringR.x=clamp(ringR.x+dLx,Rmin,Rmax); }
+    else if(dLx<0){ ringR.x=clamp(ringR.x-dLx*0.55,Rmin,Rmax); }
+    if(act && (edgeOver>0.04||ringL.hx<=minX+0.01) && tension<0.98){ ringR.x=clamp(ringR.x+1.3*dt,Rmin,Rmax); }
+    if(ringR.x-ringL.hx<0.26) ringR.x=Math.min(Rmax,ringL.hx+0.26);
+    if(ringR.x-ringL.hx<0.26) ringL.hx=ringL.x=ringR.x-0.26;
+    const ry=clamp(0.76+0.36*(ringL.hy-0.76),0.4,1.3);
+    ringR.y=appr(ringR.y,ry,3.5,dt);
+    Rr.tx=ringR.x+0.3; Rr.sit=appr(Rr.sit,0,6,dt);
+  } else {
+    ringR.x=appr(ringR.x,0.5,3,dt); ringR.y=appr(ringR.y,1.12,3,dt);
+    Rr.tx=0; Rr.sit=appr(Rr.sit,1,5,dt);
+  }
+  prevLx=ringL.hx;
+  // ring bounce (echo or reaction)
+  ringR.bt+=dt; const rb=ringR.bt<0.5?Math.sin(ringR.bt/0.5*TAU)*ringR.bamp*(1-ringR.bt/0.5):0;
+  endL.x=ringL.x; endL.y=ringL.y; endR.x=ringR.x; endR.y=ringR.y+rb;
+  // ---- cloth state ----
+  const d=hyp(endR.x-endL.x,endR.y-endL.y), ratio=d/L0;
+  const hb=sstep(0.95,1.35,Math.min(endL.y,endR.y))*0.25;
+  const lt=clamp(sstep(0.52,0.86,ratio)+hb*sstep(0.45,0.7,ratio),0,1.05);
+  lift=appr(lift,lt,lt>lift?2.6:1.6,dt);
+  roofTilt=endL.y-endR.y;
+  if(lift>0.7){ if(!sub.roof){sub.roof=true; note('roof',1); SFX.whoosh(true,0.7);} sub.flutter=true; mem.roofTilt=roofTilt; if(Math.abs(roofTilt)>0.3 && !sub.tilt){ sub.tilt=true; note('tilt',roofTilt.toFixed(2)); } }
+  if(sub.roof&&sub.tilt&&!disc.d3){ disc.d3=true; note('D3',1); successFx(ringL.hx,ringL.hy,[67,71,74]); }
+  // drag moved cloth
+  if(act && hyp(pvx,pvy)>0) sub.dragCloth+=hyp(pvx,pvy);
+  if(!disc.d1 && sub.dragCloth>0.5){ disc.d1=true; note('D1',1); }
+  // crease memory (curtain folds keep a mark, biased to the side the hands were)
+  if(slack>0.4){
+    const off=(endL.x+endR.x)/2;
+    for(let i=1;i<N-1;i++){ const tt=i/(N-1), side=clamp((tt-0.5)*Math.sign(-off||1)*2+0.5,0,1); const tgt=Math.sin(tt*Math.PI*5)*slack*(0.35+0.65*side); crease[i]=appr(crease[i],tgt,0.25,dt); }
+  }
+  // ---- chair hide / reveal ----
+  chairHidden=computeChairHidden();
+  if(chairHidden){ chairHidT+=dt; chairLastHid=T; } else chairHidT=0;
+  if(!chairOpen){
+    if(chairHidden && chairHidT>0.25 && !sub.hidSeen){ sub.hidSeen=true; note('hide',1); }
+    if(sub.hidSeen && !chairHidden && curtain && !sub.revealSide && Math.abs((endL.x+endR.x)/2)>0.2){ sub.revealSide=true; note('peek',1); SFX.chime([mtof(79)],0.1); chairWob=1; }
+    if(sub.revealSide && chairHidden && chairHidT>0.2 && !sub.rehide){ sub.rehide=true; note('rehide',1); }
+    if(sub.rehide && !disc.d2){ disc.d2=true; note('D2',1); successFx(0,0.5,[64,67,72]); }
+    // close the little curtain, then pull up -> chair appears at centre
+    if(curtain && T-chairLastHid<1.0 && ringL.hy>1.1 && handVY>0.3 && act){ startReveal(); return; }
+  }
+  // ---- shake strokes => travelling waves ----
+  if(act){
+    const dir=Math.sign(handVY);
+    if(Math.abs(handVY)>0.6 && dir!==0 && dir!==strokeDir){
+      const amp=Math.abs(ringL.hy-strokeExt)*0.5;
+      if(strokeDir!==0 && amp>0.07 && T-lastStroke>0.12) onStroke(amp);
+      strokeDir=dir; strokeExt=ringL.hy;
+    }
+  }
+  if(echoPending>0 && T-lastStroke>1.0){ echoPending=0; partnerEcho(); }
+  // ---- overpull: partner digs in / opening after swap ----
+  if(overpull>0.12){ overT+=dt; creakT-=dt; if(creakT<0){ SFX.creak(); creakT=0.5; } } else overT=0;
+  if(sub.swapDone && overT>0.3 && overpull>0.22){ startFinale(); return; }
+  // ---- shade under spotlight ----
+  shadeOver=false;
+  if(chairOpen>0.9){
+    shadeOver=headInShade(Rr);
+    if(shadeOver && !sub.shadeIn && lift>0.4 && act){ sub.shadeIn=true; note('shade',1); SFX.chime([mtof(76),mtof(81)],0.1); }
+    if(sub.shadeIn && !shadeOver) sub.shadeOut=true;
+    if(sub.shadeIn && sub.sitSeen && !disc.d5){ disc.d5=true; note('D5',1); successFx(0,0.9,[72,76,79]); }
+  }
+  // ---- characters ----
+  S.tx=clamp(ringL.hx-0.32,-Wh+0.27,Wh-0.2);
+  if(ringL.grow>0.01) S.tx=clamp(ringL.hx-0.3,-Wh+0.27,Wh);
+  S.hand.x=ringL.hx; S.hand.y=ringL.hy; S.crouch=sstep(0.5,0.18,ringL.hy); S.sit=appr(S.sit,0,6,dt);
+  S.off.x=S.x-0.18; S.off.y=0.32+(overpull>0.1?0.2:0);
+  S.lean=overpull>0.05?-0.5:appr(S.lean,0,4,dt);
+  S.dir=1; Rr.dir=chairOpen?1:-1;
+  Rr.hand.x=ringR.x; Rr.hand.y=ringR.y+rb;
+  Rr.off.x=Rr.x+(chairOpen?-0.15:0.17); Rr.off.y=chairOpen?0.45:0.32;
+  // partner faces react to state
+  if(!chairOpen){
+    Rr.crouch=0;
+    Rr.lean=overpull>0.05?0.5:(tension>0.9?0.3:(curtain?-0.1:0));
+    Rr.face=overpull>0.05||tension>0.9?'laugh':(curtain?'slump':'smile');
+  } else {
+    Rr.lean=0; Rr.crouch=0;
+    Rr.face=shadeOver?'content':'squint';
+    if(!shadeOver) Rr.off.y=0.75+Math.sin(T*12)*0.06, Rr.off.x=Rr.x-0.12; // fanning
+  }
+  S.face=overpull>0.05?'laugh':(act?'smile':'smile');
+  if(dance>0){ S.face='laugh'; Rr.face='laugh'; }
+  // gaze: partner looks at the one lure (the ring) or at the shake
+  const g=goal();
+  Rr.gx=ringL.hx+(cue.t<0.8?cue.dx*0.4:0); Rr.gy=ringL.hy+(cue.t<0.8?cue.dy*0.4:0);
+  S.gx=ringR.x; S.gy=ringR.y;
+  if(g==='pullin'){ Rr.beckon=Math.max(Rr.beckon,0.6); }
+  if(g==='cover'){ Rr.gx=0; Rr.gy=0.3; S.gx=0; S.gy=0.3; }
+}
+function successFx(x,y,notes){
+  emit(x,y,10,'cool',1.2);
+  if(AC){ const t=qNext(EIGHTH); notes.forEach((m,i)=>bell(mtof(m),t+i*0.08,0.12)); }
+}
+function onStroke(amp){
+  lastStroke=T; echoPending=1;
+  const low=((ringL.hy+strokeExt)/2)<0.55;
+  mem.lastShakeLow=low; mem.lastShakeAmp=amp;
+  energy+=amp*2.2;
+  const Tt=lerp(1.2,0.42,clamp(tension,0,1));
+  let at=T+Tt*0.9, qa=0;
+  if(AC){ const tt=AC.currentTime+Tt*0.9; qa=Math.ceil(tt/EIGHTH)*EIGHTH; at=T+(qa-AC.currentTime); }
+  // note pitch by height, timbre by tension
+  const deg=PENTA[clamp(Math.round((ringL.hy-0.15)/1.35*8),0,8)];
+  const base=low?45:57;
+  if(AC){ pluck(mtof(base+deg),qa,0.17,clamp(tension,0,1)); if(low) bass(mtof(base-12+deg%12),qa,0.25); }
+  sub.wave=true; if(low) sub.lowWave=true;
+  const big=energy>2.6 || rnd()<1/16;
+  later(at-T,()=>{ waveArrive(amp,low,big); });
+  if(big) energy=0;
+}
+function waveArrive(amp,low,big){
+  const p=CH[res];
+  if(!chairOpen){ if(low){ p.squatV-=6+amp*12; } else { p.hopV+=1.2+amp*3; p.squatV-=2; } }
+  else { p.hopV+=0.4; }
+  accLevel=Math.min(4,accLevel+0.75); kickOrn(0.4+amp);
+  if(accLevel>1.1) sub.layer=true;
+  if(sub.wave&&sub.lowWave&&sub.layer&&!disc.d4){ disc.d4=true; note('D4',1); successFx(ringR.x,ringR.y,[69,72,76]); }
+  if(big){ dance=4.5; kickOrn(2); emit(0,topH-0.6,14,'conf',1); note('bigwave',1); if(AC){const t=qNext(EIGHTH); [72,76,79,84].forEach((m,i)=>bell(mtof(m),t+i*0.1,0.1));} }
+}
+function partnerEcho(){
+  // partner answers with the last shaking style; the wave runs back the other way
+  ringR.bt=0; ringR.bamp=mem.lastShakeLow?-0.28:0.2;
+  const p=CH[res]; if(!chairOpen){ if(mem.lastShakeLow) p.squatV-=5; else p.hopV+=1; }
+  if(AC){ const t=qNext(EIGHTH); pluck(mtof((mem.lastShakeLow?45:62)+7),t,0.1,0.4); }
+}
+function headInShade(c){
+  const ps=pose(c); const hx=ps.hdX, hyy=ps.hdY;
+  const sx=0, sy=topH+0.2;
+  const ang=Math.atan2(hx-sx,sy-hyy);
+  let mn=9,mx=-9,above=false;
+  for(let k=0;k<NP;k++){ if(cy_[k]>=sy) continue; const a=Math.atan2(cx_[k]-sx,sy-cy_[k]); if(a<mn)mn=a; if(a>mx)mx=a; if(cy_[k]>hyy+0.05) above=true; }
+  return above && ang>mn && ang<mx && endL.y>hyy && endR.y>hyy-0.1;
+}
+
+// ---------- reveal (chair appears, partner sits) ----------
+function startReveal(){
+  release(false); setPhase('reveal'); note('reveal',1);
+  SFX.whoosh(true,0.6); SFX.rise(0.6);
+  liftOv=1.0;
+}
+function updReveal(dt){
+  const t=pt, P=CH[sup], B=CH[res];
+  if(t>0.35 && t-dt<=0.35){ SFX.pop(); emit(0,0.45,18,'cool',1.4); chairWob=1; }
+  chairOpen=ease(seg01(t,0.35,0.85));
+  spot=ease(seg01(t,0.5,1.2));
+  B.face='wow'; P.face='laugh';
+  ringR.x=appr(ringR.x,0.5,2.5,dt); ringR.y=appr(ringR.y,1.12,3,dt);
+  B.tx=t<0.9?ringR.x+0.25:0; if(t>0.9) B.sit=appr(B.sit,1,4,dt);
+  B.hand.x=ringR.x; B.hand.y=ringR.y; B.dir=t<0.9?-1:1;
+  P.hand.x=ringL.hx; P.hand.y=ringL.hy; P.tx=ringL.hx-0.32;
+  endL.x=ringL.x; endL.y=ringL.y; endR.x=ringR.x; endR.y=ringR.y;
+  B.gx=0; B.gy=0.3; P.gx=0; P.gy=0.3;
+  if(t>1.0 && liftOv>=0) liftOv=-1;
+  if(t>1.7){
+    setPhase('play'); disc.d5=disc.d5; sub.sitSeen=true; curtain=false;
+    if(AC){ const tt=qNext(EIGHTH); [60,67,72,76].forEach((m,i)=>bell(mtof(m),tt+i*0.09,0.12)); }
+    note('sit',res);
+  }
+}
+
+// ---------- swap (giant ring props the roof, worker is invited under) ----------
+let swapA=0, swapB=1;
+function startSwap(){
+  release(false); setPhase('swap'); note('giant',1);
+  { const R=Math.min(farY/2,0.62); farY=2*R; farX=Math.max(farX,-Wh+R+0.06); }
+  ringL.planted=true; ringL.gcx=farX; ringL.gcy=farY;
+  SFX.thud(); SFX.chime([mtof(60),mtof(67),mtof(72),mtof(79)],0.14,0.09);
+  emit(farX,farY*0.5,20,'heat',1.2);
+  swapA=sup; swapB=res; liftOv=1;
+}
+function updSwap(dt){
+  const t=pt, A=CH[swapA], B=CH[swapB];
+  ringL.giant=appr(ringL.giant,t<3.6?1:0,t<3.6?8:6,dt);
+  ringL.grow=t<3.6?1:appr(ringL.grow,0,6,dt);
+  ringL.x=farX; ringL.y=farY; endL.x=farX; endL.y=farY; endR.x=ringR.x; endR.y=ringR.y;
+  // A (worker) lets go, walks under the roof
+  B.beckon=t<1.8?1:0;
+  A.face='laugh'; B.face='laugh';
+  if(t<0.6){ A.hand.x=lerp(A.hand.x,farX,0.2); A.hand.y=lerp(A.hand.y,farY,0.2); }
+  else { A.hand.x=A.x+0.15; A.hand.y=0.35; }
+  if(t>0.6&&t<2.2){ A.tx=-0.3; A.dir=1; }
+  // B stands, A sits, ring R passes hand to hand
+  if(t>1.7){ B.sit=appr(B.sit,0,5,dt); B.tx=t<2.9?0.3:Math.max(-Wh+0.27,farX-0.3); B.dir=t<2.9?-1:1; }
+  if(t>2.1){ A.tx=0; A.sit=appr(A.sit,1,5,dt); }
+  if(t<2.4){ B.hand.x=ringR.x; B.hand.y=ringR.y; A.hand.x=A.hand.x; }
+  else { A.hand.x=ringR.x; A.hand.y=ringR.y; }
+  if(t>2.4 && t-dt<=2.4){ SFX.pop(); emit(ringR.x,ringR.y,10,'heat',0.9); }
+  if(t<2.4){ B.off.x=B.x+0.1; B.off.y=0.3; }
+  if(t>=2.4){ B.hand.x=lerp(B.hand.x,B.x+0.17,0.1); B.hand.y=lerp(B.hand.y,0.4,0.1); }
+  if(t>3.3){ B.hand.x=farX; B.hand.y=farY; }
+  if(t>3.6 && t-dt<=3.6){ SFX.chime([mtof(79),mtof(84)],0.12); emit(farX,farY,12,'heat',0.8); }
+  A.gx=B.x; A.gy=0.9; B.gx=A.x; B.gy=0.9;
+  if(t>4.3){
+    sup=swapB; res=swapA; ringL.planted=false; ringL.giant=0; ringL.grow=0; bigArmed=false;
+    ringL.hx=farX; ringL.hy=farY; ringL.x=farX; ringL.y=farY; liftOv=-1;
+    sub.swapDone=true; mem.lastRester=res; mem.swapOrder.push(res); if(mem.swapOrder.length>6) mem.swapOrder.shift();
+    if(!disc.d6){ disc.d6=true; note('D6',1); }
+    note('swap',res);
+    setPhase('play'); ringL.heat=1;
+  }
+}
+
+// ---------- finale: open the curtain toward the audience ----------
+let fin={tilt:0,first:0};
+function startFinale(){
+  release(false); setPhase('finale'); note('open',cycle);
+  fin.tilt=clamp(mem.roofTilt,-0.6,0.6); fin.first=res; // rester's side opens first
+  SFX.whoosh(true,1.0);
+  if(AC){ const t=qNext(BEAT); [[60,64,67],[65,69,72],[67,71,74],[72,76,79]].forEach((c,i)=>c.forEach(m=>{ tone(mtof(m),t+i*0.3,0.5,'triangle',0.06); })); }
+}
+function updFinale(dt){
+  const t=pt, S=CH[sup], Rr=CH[res];
+  const edge=Wh-0.5;
+  if(t<1.3){
+    // rester stands and pulls the other way
+    Rr.sit=appr(Rr.sit,0,5,dt); chairOpen=appr(chairOpen,1,1,dt);
+    ringR.x=appr(ringR.x,edge,2.4,dt); ringR.y=appr(ringR.y,1.25-fin.tilt*0.5,3,dt);
+    ringL.hx=appr(ringL.hx,-edge,2.4,dt); ringL.hy=appr(ringL.hy,1.25+fin.tilt*0.5,3,dt);
+    ringL.x=ringL.hx; ringL.y=ringL.hy;
+    endL.x=ringL.x; endL.y=ringL.y; endR.x=ringR.x; endR.y=ringR.y;
+    S.tx=ringL.hx-0.3; Rr.tx=ringR.x+0.3; S.dir=1; Rr.dir=-1;
+    S.hand.x=ringL.hx; S.hand.y=ringL.hy; Rr.hand.x=ringR.x; Rr.hand.y=ringR.y;
+    S.lean=-0.5; Rr.lean=0.5; S.face='laugh'; Rr.face='laugh';
+    liftOv=1.1;
+  } else if(t<5.2){
+    // the cloth flies up and away; stage + audience revealed
+    const u=seg01(t,1.3,2.6);
+    const dl=fin.first===sup?0:0.25, dr=fin.first===sup?0.25:0;
+    const uL=ease(seg01(t,1.3+dl,2.5+dl)), uR=ease(seg01(t,1.3+dr,2.5+dr));
+    if(t-dt<1.3){ SFX.whoosh(true,1.2); for(const c of CH){ c.hopV+=1.6; } }
+    endL.x=lerp(-edge,-Wh-0.6,uL); endL.y=lerp(1.25+fin.tilt*0.5,topH+1.6+fin.tilt*0.6,uL);
+    endR.x=lerp(edge,Wh+0.6,uR); endR.y=lerp(1.25-fin.tilt*0.5,topH+1.6-fin.tilt*0.6,uR);
+    ringL.r=ringR.r=0.075*(1-u);
+    S.glove=Rr.glove=1; S.hand.x=S.x+0.12; Rr.hand.x=Rr.x-0.12;
+    const cheer=Math.abs(Math.sin(t*6));
+    S.hand.y=lerp(1.3,1.1,cheer); Rr.hand.y=lerp(1.3,1.1,cheer);
+    S.tx=-0.35; Rr.tx=0.35; S.lean=0; Rr.lean=0; S.dir=1; Rr.dir=-1;
+    audience=appr(audience,1,3,dt); spot=appr(spot,1,3,dt); dance=Math.max(dance,1);
+    // bows: rester bows first
+    const bf=fin.first;
+    CH[bf].bow=Math.max(0,Math.sin(clamp((t-3.0)/1.0,0,1)*Math.PI));
+    CH[1-bf].bow=Math.max(0,Math.sin(clamp((t-3.5)/1.0,0,1)*Math.PI));
+    if(rnd()<dt*14) SFX.clap(0.25+rnd()*0.3);
+    if(rnd()<dt*10) emit((rnd()-0.5)*Wh*1.6,topH-0.2,1,'conf',0.6);
+    if(t>2.6 && t-dt<=2.6){ disc.open=true; note('OPEN',cycle); kickOrn(2.5); }
+    liftOv=1.4;
+  } else if(t<7.6){
+    // cloth drifts back down to the backdrop, everyone goes back to the start marks
+    const u=ease(seg01(t,5.2,7.2));
+    endL.x=lerp(-Wh-0.6,-L0/2,u); endL.y=lerp(topH+1.6,battenY,u);
+    endR.x=lerp(Wh+0.6,L0/2,u); endR.y=lerp(topH+1.6,battenY,u);
+    liftOv=lerp(0.6,0,u); chairOpen=1-ease(seg01(t,5.6,6.6)); spot=1-u; audience=1-ease(seg01(t,6.2,7.4));
+    CH[0].tx=-0.5; CH[1].tx=0.5; CH[0].dir=1; CH[1].dir=-1;
+    for(const c of CH){ c.sit=appr(c.sit,0,6,dt); c.bow=0; c.face='smile'; c.hand.x=c.x+c.dir*0.12; c.hand.y=0.4; }
+  } else {
+    liftOv=-1; lift=0; cycle++; note('cycle',cycle);
+    for(const k in sub){ if(typeof sub[k]==='boolean') sub[k]=false; }
+    sub.dragCloth=0;
+    startCycle(false);
+  }
+}
+
+function clampAll(){
+  for(const c of CH){ c.x=clamp(c.x,-Wh-0.2,Wh+0.2); c.tx=clamp(c.tx,-Wh+0.1,Wh-0.1); }
+  ringL.hx=clamp(ringL.hx,-Wh+0.12,Wh); ringR.x=clamp(ringR.x,-Wh,Wh-0.2);
+  gloveP.x=clamp(gloveP.x,-Wh+0.1,Wh-0.1);
+}
+
+// =====================================================================
+//  drawing
+// =====================================================================
+function band(v){ return PAL[clamp(Math.round(v*5),1,5)]; }
+function line(pts,lw,col){ ctx.beginPath(); ctx.moveTo(X(pts[0]),Y(pts[1])); for(let i=2;i<pts.length;i+=2) ctx.lineTo(X(pts[i]),Y(pts[i+1])); ctx.lineWidth=lw*h; ctx.strokeStyle=col; ctx.stroke(); }
+function circ(x,y,r,fill,stroke,lw){ ctx.beginPath(); ctx.arc(X(x),Y(y),Math.max(0.5,r*h),0,TAU); if(fill){ctx.fillStyle=fill; ctx.fill();} if(stroke){ctx.lineWidth=lw*h; ctx.strokeStyle=stroke; ctx.stroke();} }
+function limb(ax,ay,bx,by,lw,col){ line([ax,ay,bx,by],lw+0.035,WHITE); line([ax,ay,bx,by],lw,col); }
+
+function drawBG(){
+  ctx.fillStyle=PAL[0]; ctx.fillRect(0,0,W,H);
+  // backdrop wall: isotherm bands
+  const wallTop=Y(topH), fy=floorY;
+  const bands=[[0.0,PAL[0]],[0.5,'#080d2a'],[0.78,PAL[1]]];
+  for(const b of bands){ const y0=lerp(wallTop,fy,b[0]); ctx.fillStyle=b[1]; ctx.fillRect(0,y0,W,fy-y0); }
+  // batten bar
+  ctx.fillStyle=PAL[2]; ctx.fillRect(X(-L0/2-0.15),Y(battenY+0.03),(L0+0.3)*h,0.03*h);
+  // floor
+  ctx.fillStyle=PAL[1]; ctx.fillRect(0,fy,W,H-fy);
+  ctx.fillStyle=PAL[2]; ctx.fillRect(0,fy,W,0.035*h);
+  ctx.fillStyle='#0b1238'; ctx.fillRect(0,fy+0.16*h,W,H-fy);
+}
+function drawSpot(){
+  if(spot<0.02) return;
+  const sx=0, sy=topH+0.2, w0=0.08, w1=0.95;
+  ctx.save(); ctx.globalAlpha=0.16*spot; ctx.fillStyle=PAL[5];
+  ctx.beginPath(); ctx.moveTo(X(sx-w0),Y(sy)); ctx.lineTo(X(sx+w0),Y(sy)); ctx.lineTo(X(sx+w1),Y(0)); ctx.lineTo(X(sx-w1),Y(0)); ctx.closePath(); ctx.fill();
+  ctx.globalAlpha=0.14*spot;
+  ctx.beginPath(); ctx.moveTo(X(sx-w0*0.5),Y(sy)); ctx.lineTo(X(sx+w0*0.5),Y(sy)); ctx.lineTo(X(sx+w1*0.55),Y(0)); ctx.lineTo(X(sx-w1*0.55),Y(0)); ctx.closePath(); ctx.fill();
+  ctx.globalAlpha=0.35*spot; ctx.beginPath(); ctx.ellipse(X(0),Y(0.0),w1*h,0.07*h,0,0,TAU); ctx.fill();
+  ctx.restore();
+}
+function drawShadow(){
+  if(spot<0.05) return;
+  const sx=0, sy=topH+0.2;
+  let mn=9,mx=-9,ai=-1,bi=-1;
+  for(let k=0;k<NP;k++){ if(cy_[k]>=sy-0.05) continue; const a=Math.atan2(cx_[k]-sx,sy-cy_[k]); if(a<mn){mn=a;ai=k;} if(a>mx){mx=a;bi=k;} }
+  if(ai<0) return;
+  const proj=k=>{ const s=sy/(sy-cy_[k]); return sx+(cx_[k]-sx)*s; };
+  ctx.save();
+  // clip to cone
+  ctx.beginPath(); ctx.moveTo(X(-0.08),Y(sy)); ctx.lineTo(X(0.08),Y(sy)); ctx.lineTo(X(0.95),Y(0)); ctx.lineTo(X(-0.95),Y(0)); ctx.closePath(); ctx.clip();
+  ctx.globalAlpha=0.36*spot; ctx.fillStyle=PAL[0];
+  ctx.beginPath(); ctx.moveTo(X(cx_[ai]),Y(cy_[ai]));
+  // follow lowest cloth row between extremes
+  const r=M-1; for(let i=0;i<N;i++){ const k=(cy_[r*N+i]<cy_[i])?r*N+i:i; ctx.lineTo(X(cx_[k]),Y(cy_[k])); }
+  ctx.lineTo(X(cx_[bi]),Y(cy_[bi])); ctx.lineTo(X(proj(bi)),Y(0)); ctx.lineTo(X(proj(ai)),Y(0)); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function drawAudience(){
+  if(audience<0.02) return;
+  const n=Math.max(5,Math.round(Wh*4)); const base=Math.min(H-safe.b+0.02*h,floorY+0.62*h);
+  for(let i=0;i<n;i++){
+    const x=-Wh*1.05+i*(2.1*Wh/(n-1)), bob=Math.abs(Math.sin(T*7+i*1.3))*0.04*audience;
+    const sy=lerp(base+0.3*h, base-0.05*h, ease(audience))-bob*h;
+    ctx.fillStyle=PAL[1]; ctx.strokeStyle=PAL[3]; ctx.lineWidth=0.02*h;
+    ctx.beginPath(); ctx.arc(X(x),sy-0.12*h,0.11*h,0,TAU); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(X(x),sy+0.05*h,0.17*h,0.12*h,0,0,TAU); ctx.fill(); ctx.stroke();
+    const cl=Math.abs(Math.sin(T*9+i*2.1));
+    ctx.fillStyle=PAL[4];
+    ctx.beginPath(); ctx.arc(X(x-0.03-cl*0.04),sy-0.3*h,0.03*h,0,TAU); ctx.arc(X(x+0.03+cl*0.04),sy-0.3*h,0.03*h,0,TAU); ctx.fill();
+  }
+}
+function drawOrnaments(){
+  for(let k=0;k<ORN.length;k++){
+    const o=ORN[k], top=topH+0.05, len=o.len;
+    const ex=o.x+Math.sin(o.a)*len, ey=top-Math.cos(o.a)*len+o.hop*0.1;
+    line([o.x,top,ex,ey],0.008,PAL[3]);
+    for(let j=0;j<3;j++){
+      const f=0.45+j*0.27, px=o.x+Math.sin(o.a)*len*f, py=top-Math.cos(o.a)*len*f+o.hop*0.1*f;
+      const s=0.065, col=PAL[3+((k+j)%3)];
+      ctx.save(); ctx.translate(X(px),Y(py)); ctx.rotate(o.a*0.8+Math.sin(T*2+k+j)*0.1*lift);
+      ctx.fillStyle=col; ctx.strokeStyle=WHITE; ctx.lineWidth=0.012*h;
+      ctx.beginPath();
+      if(o.kind===0){ ctx.moveTo(-s*h,0); ctx.lineTo(s*h,0); ctx.lineTo(0,s*1.6*h); ctx.closePath(); }
+      else if(o.kind===1){ for(let q=0;q<10;q++){ const a=q/10*TAU-Math.PI/2, rr=(q%2?0.45:1)*s*h; ctx.lineTo(Math.cos(a)*rr,Math.sin(a)*rr+s*h); } ctx.closePath(); }
+      else { ctx.arc(0,s*0.9*h,s*0.9*h,Math.PI,0,true); ctx.closePath(); }
+      ctx.fill(); ctx.stroke(); ctx.restore();
+    }
+  }
+}
+function drawChair(){
+  const o=chairOpen, wb=Math.sin(T*30)*chairWob*0.03;
+  ctx.save(); ctx.translate(X(0),Y(0)); ctx.rotate(wb);
+  const u=h;
+  ctx.lineJoin='round'; ctx.lineCap='round';
+  if(o<0.5){
+    // folded chair leaning
+    const s=1-o*2;
+    ctx.save(); ctx.rotate(-0.18*s);
+    ctx.fillStyle=PAL[2]; ctx.strokeStyle=WHITE; ctx.lineWidth=0.03*u;
+    ctx.beginPath(); ctx.rect(-0.07*u,-0.42*u,0.14*u,0.42*u); ctx.fill(); ctx.stroke();
+    ctx.fillStyle=PAL[3]; ctx.fillRect(-0.04*u,-0.37*u,0.08*u,0.1*u);
+    ctx.restore();
+  } else {
+    const s=(o-0.5)*2, sw=0.36*u*lerp(0.5,1,s), sy=-0.32*u, by=-lerp(0.4,0.66,s)*u;
+    ctx.strokeStyle=WHITE; ctx.lineWidth=0.06*u;
+    ctx.beginPath(); ctx.moveTo(-sw/2,0); ctx.lineTo(-sw/2,sy); ctx.moveTo(sw/2,0); ctx.lineTo(sw/2,sy); ctx.moveTo(-sw/2,sy); ctx.lineTo(-sw/2,by); ctx.stroke();
+    ctx.strokeStyle=PAL[3]; ctx.lineWidth=0.03*u; ctx.stroke();
+    ctx.fillStyle=PAL[4]; ctx.strokeStyle=WHITE; ctx.lineWidth=0.025*u;
+    ctx.beginPath(); ctx.rect(-sw/2-0.03*u,sy-0.04*u,sw+0.06*u,0.06*u); ctx.fill(); ctx.stroke();
+    ctx.fillStyle=PAL[3];
+    ctx.beginPath(); ctx.rect(-sw/2-0.04*u,by,0.1*u,(sy-by)*0.6); ctx.fill(); ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawCloth(){
+  const lv=lift;
+  for(let r=0;r<M-1;r++){
+    for(let i=0;i<N-1;i++){
+      const a=r*N+i, b=a+1, c=b+N, d=a+N;
+      const up=((cy_[d]+cy_[c])-(cy_[a]+cy_[b]))/(2*rowRest);
+      const wv=((ty[i]-tLine[i])+(ty[i+1]-tLine[i+1]))*0.5;
+      let v=0.55-0.1*r/(M-1);
+      v+=up>0?(-0.08+0.06*Math.sin(i*0.6+T*0.5))*lv:0;
+      if(r===0) v+=0.22*clamp(tension-0.5,0,0.6);
+      v+=clamp(wv*1.6,-0.25,0.35);
+      v+=(((i>>1)%2)?0.12:-0.1)*clamp(slack*1.6,0,1)*(1-lv);
+      v+=crease[i]*0.05+0.07*Math.sin(i*0.55+r*0.3)*(1-lv);
+      const col=band(v);
+      ctx.fillStyle=col; ctx.strokeStyle=col; ctx.lineWidth=1.2;
+      ctx.beginPath(); ctx.moveTo(X(cx_[a]),Y(cy_[a])); ctx.lineTo(X(cx_[b]),Y(cy_[b])); ctx.lineTo(X(cx_[c]),Y(cy_[c])); ctx.lineTo(X(cx_[d]),Y(cy_[d])); ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+  }
+  // edges: hem bands
+  ctx.lineJoin='round'; ctx.lineCap='round';
+  smoothRow(M-1); ctx.lineWidth=0.022*h; ctx.strokeStyle=PAL[4]; ctx.stroke();
+  smoothRow(0); ctx.lineWidth=0.032*h; ctx.strokeStyle=PAL[5]; ctx.stroke();
+}
+function smoothRow(r){
+  const o=r*N; ctx.beginPath(); ctx.moveTo(X(cx_[o]),Y(cy_[o]));
+  for(let i=1;i<N-1;i++){ const k=o+i; ctx.quadraticCurveTo(X(cx_[k]),Y(cy_[k]),(X(cx_[k])+X(cx_[k+1]))/2,(Y(cy_[k])+Y(cy_[k+1]))/2); }
+  ctx.lineTo(X(cx_[o+N-1]),Y(cy_[o+N-1]));
+}
+function drawGlove(x,y,ang,sq,open,heat,scale){
+  const s=(scale||1)*h*0.1;
+  ctx.save(); ctx.translate(X(x),Y(y)); ctx.rotate(ang);
+  ctx.scale(1+sq*0.35,1-sq*0.3);
+  ctx.lineJoin='round';
+  ctx.beginPath();
+  if(open){
+    ctx.ellipse(0,0,s,s*0.95,0,0,TAU);
+    for(let f=0;f<4;f++){ const a=(-0.5+f*0.33), fx=Math.cos(a)*s*1.25, fy=Math.sin(a)*s*1.25; ctx.moveTo(fx+s*0.45,fy); ctx.ellipse(fx,fy,s*0.5,s*0.2,a,0,TAU); }
+    ctx.moveTo(s*0.1,-s*1.05); ctx.ellipse(0,-s*1.0,s*0.22,s*0.45,-0.6,0,TAU);
+  } else {
+    ctx.ellipse(0,0,s*1.05,s*0.95,0,0,TAU);
+  }
+  ctx.strokeStyle=PAL[1]; ctx.lineWidth=0.03*h; ctx.stroke();
+  ctx.fillStyle=WHITE; ctx.fill();
+  ctx.strokeStyle=PAL[4]; ctx.lineWidth=0.01*h;
+  if(!open){ for(let f=0;f<3;f++){ ctx.beginPath(); ctx.arc(s*0.55,(-0.45+f*0.45)*s,s*0.25,-1.2,1.2); ctx.stroke(); } }
+  if(heat>0.04){
+    // heat isotherms at contact (only place warm colours appear)
+    const hr=s*(0.55+0.5*heat), cx0=open?s*0.5:s*0.3;
+    ctx.globalAlpha=Math.min(1,heat*1.4);
+    ctx.fillStyle=HEAT[0]; ctx.beginPath(); ctx.ellipse(cx0,0,hr,hr*0.85,0,0,TAU); ctx.fill();
+    ctx.fillStyle=HEAT[1]; ctx.beginPath(); ctx.ellipse(cx0+hr*0.08,0,hr*0.66,hr*0.56,0,0,TAU); ctx.fill();
+    ctx.fillStyle=HEAT[2]; ctx.beginPath(); ctx.ellipse(cx0+hr*0.12,0,hr*0.34,hr*0.28,0,0,TAU); ctx.fill();
+    ctx.globalAlpha=1;
+  }
+  ctx.restore();
+}
+function drawRing(x,y,r,sq,heat,glow){
+  if(r<0.005) return;
+  const R=r*h*(1+sq*0.25), Ry=r*h*(1-sq*0.2);
+  ctx.save(); ctx.translate(X(x),Y(y));
+  if(glow>0){ ctx.globalAlpha=glow; ctx.strokeStyle=PAL[5]; ctx.lineWidth=0.025*h; ctx.beginPath(); ctx.ellipse(0,0,R+0.07*h+Math.sin(T*6)*0.02*h,Ry+0.07*h+Math.sin(T*6)*0.02*h,0,0,TAU); ctx.stroke(); ctx.globalAlpha=1; }
+  const lw=Math.max(3,0.045*h*Math.min(1,r/0.075));
+  ctx.lineWidth=lw+0.03*h; ctx.strokeStyle=WHITE; ctx.beginPath(); ctx.ellipse(0,0,R,Ry,0,0,TAU); ctx.stroke();
+  const hc=heat>0.66?2:heat>0.33?1:0;
+  ctx.lineWidth=lw; ctx.strokeStyle=HEAT[0]; ctx.stroke();
+  if(hc>=1){ ctx.lineWidth=lw*0.6; ctx.strokeStyle=HEAT[1]; ctx.stroke(); }
+  if(hc>=2){ ctx.lineWidth=lw*0.25; ctx.strokeStyle=HEAT[2]; ctx.stroke(); }
+  ctx.restore();
+}
+function ik(sx,sy,hx,hy,len,bendSign){
+  const dx=hx-sx, dy=hy-sy, d=hyp(dx,dy)||1e-6;
+  if(d>=len*2) return {ex:sx+dx/2,ey:sy+dy/2,stretch:d/(len*2)};
+  const a=Math.acos(clamp(d/(2*len),0,1)), base=Math.atan2(dy,dx)+a*bendSign;
+  return {ex:sx+Math.cos(base)*len,ey:sy+Math.sin(base)*len,stretch:1};
+}
+function drawChar(c){
+  const p=pose(c), dir=c.dir, u=h;
+  const bodyCol=c.id===0?[PAL[2],PAL[3],PAL[4]]:[PAL[2],PAL[3],PAL[3]];
+  const wob=Math.sin(T*24)*c.wob*0.04;
+  ctx.lineCap='round'; ctx.lineJoin='round';
+  // legs
+  const kneeOut=0.05+c.crouch*0.08+Math.max(0,c.squat)*0.1;
+  for(let s=-1;s<=1;s+=2){
+    const hx=p.hipX+s*0.055, hy=p.hipY;
+    if(c.sit>0.5){
+      const kx=hx+dir*0.17, ky=hy+0.01, fx=kx+dir*0.01, fy=0.0;
+      limb(hx,hy,kx,ky,0.075,PAL[1]); limb(kx,ky,fx,fy+0.03,0.07,PAL[1]);
+      line([fx-0.02,0.02,fx+dir*0.06,0.02],0.05,WHITE);
+    } else {
+      const ph=c.walk+(s>0?Math.PI:0), st=Math.sin(ph)*0.08, lift2=Math.max(0,Math.cos(ph))*0.04*(Math.abs(c.tx-c.x)>0.02?1:0);
+      const fx=hx+st, fy=0.03+lift2;
+      const kx=(hx+fx)/2+dir*kneeOut, ky=(hy+fy)/2+0.02;
+      limb(hx,hy,kx,ky,0.075,PAL[1]); limb(kx,ky,fx,fy,0.07,PAL[1]);
+      line([fx-0.03,0.02,fx+dir*0.06,0.02],0.05,WHITE);
+    }
+  }
+  // torso (isotherm layers)
+  ctx.save(); ctx.translate(X(p.hipX),Y(p.hipY)); ctx.rotate(wob+(p.shX-p.hipX)*0.9);
+  const tw=0.15*u, th=(p.shY-p.hipY+0.05)*u;
+  ctx.fillStyle=bodyCol[0]; ctx.strokeStyle=WHITE; ctx.lineWidth=0.03*u;
+  ctx.beginPath(); ctx.moveTo(-tw*0.85,0.04*u); ctx.quadraticCurveTo(-tw*1.1,-th*0.6,-tw*0.9,-th); ctx.lineTo(tw*0.9,-th); ctx.quadraticCurveTo(tw*1.1,-th*0.6,tw*0.85,0.04*u); ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle=bodyCol[1]; ctx.beginPath(); ctx.ellipse(0,-th*0.55,tw*0.62,th*0.4,0,0,TAU); ctx.fill();
+  ctx.fillStyle=bodyCol[2]; ctx.beginPath(); ctx.ellipse(0,-th*0.6,tw*0.3,th*0.2,0,0,TAU); ctx.fill();
+  if(c.id===1){ ctx.fillStyle=PAL[5]; ctx.fillRect(-tw*0.9,-th*0.25,tw*1.8,0.035*u); }
+  ctx.restore();
+  // arms
+  const shA={x:p.shX+dir*0.11,y:p.shY}, shB={x:p.shX-dir*0.11,y:p.shY};
+  const drawArm=(sh,hand,bend,gloveOpen,heat,sq,holdRing)=>{
+    const e=ik(sh.x,sh.y,hand.x,hand.y,0.29,bend);
+    limb(sh.x,sh.y,e.ex,e.ey,0.06,PAL[2]); limb(e.ex,e.ey,hand.x,hand.y,0.055,PAL[2]);
+    const ang=-Math.atan2(hand.y-e.ey,hand.x-e.ex);
+    drawGlove(hand.x,hand.y,ang,sq,gloveOpen,heat,1);
+  };
+  // off arm (beckon / fan / idle)
+  let off=c.off;
+  if(c.beckon>0.05){ off={x:p.shX-dir*0.05+Math.sin(T*9)*0.07*c.beckon,y:p.shY+0.25}; }
+  if(c.bow>0.05){ off={x:p.shX-dir*0.05,y:p.shY-0.3}; }
+  drawArm(shB,off,dir>0?-1:1,c.beckon>0.05,0,0,false);
+  // main arm
+  const isP=c.id===0, inGreet=phase==='greet'||(phase==='join'&&pt<0.4);
+  const gq=inGreet?(isP?gloveP.sq:gloveB.sq):0, gh=inGreet?(isP?gloveP.heat:gloveB.heat):(c.glove<0.5&&c.holds?0.35:0);
+  drawArm(shA,c.hand,dir>0?1:-1,inGreet&&!isP?true:(inGreet&&isP?false:c.glove>0.5&&phase!=='finale'?false:phase==='finale'),gh,gq,true);
+  // head
+  const hx=p.hdX+wob*0.3, hy=p.hdY, hr=0.135;
+  circ(hx,hy,hr,PAL[3],WHITE,0.035);
+  circ(hx+dir*0.015,hy-0.01,hr*0.62,PAL[4],null,0);
+  // hat / hair
+  ctx.save(); ctx.translate(X(hx),Y(hy));
+  ctx.strokeStyle=WHITE; ctx.lineWidth=0.025*u;
+  if(c.id===0){ ctx.fillStyle=PAL[4]; ctx.beginPath(); ctx.arc(0,-hr*0.35*u,hr*1.02*u,Math.PI*1.05,Math.PI*1.95); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.beginPath(); ctx.moveTo(dir*hr*0.2*u,-hr*0.55*u); ctx.lineTo(dir*hr*1.35*u,-hr*0.45*u); ctx.stroke(); }
+  else { ctx.fillStyle=PAL[2]; ctx.beginPath(); ctx.arc(-dir*hr*0.9*u,-hr*0.75*u,hr*0.42*u,0,TAU); ctx.fill(); ctx.stroke(); ctx.beginPath(); ctx.arc(dir*hr*0.55*u,-hr*1.0*u,hr*0.36*u,0,TAU); ctx.fill(); ctx.stroke(); }
+  ctx.restore();
+  drawFace(c,hx,hy,hr);
+}
+function drawFace(c,hx,hy,hr){
+  const u=h, dir=c.dir;
+  const gx=clamp((c.gx-hx)*0.05,-0.02,0.02), gy=clamp((c.gy-hy)*0.05,-0.015,0.015);
+  const ex1=hx-0.045+dir*0.015, ex2=hx+0.045+dir*0.015, ey=hy+0.02;
+  ctx.strokeStyle=WHITE; ctx.fillStyle=WHITE; ctx.lineCap='round';
+  const f=c.face, blink=c.blink>0;
+  ctx.lineWidth=0.024*u;
+  if(f==='content'||f==='laugh'||blink){
+    for(const ex of [ex1,ex2]){ ctx.beginPath(); ctx.arc(X(ex),Y(ey-0.005),0.022*u,Math.PI*1.1,Math.PI*1.9); ctx.stroke(); }
+  } else if(f==='squint'){
+    for(const [ex,s] of [[ex1,1],[ex2,-1]]){ ctx.beginPath(); ctx.moveTo(X(ex-0.02*s),Y(ey+0.015)); ctx.lineTo(X(ex+0.015*s),Y(ey)); ctx.lineTo(X(ex-0.02*s),Y(ey-0.015)); ctx.stroke(); }
+  } else {
+    for(const ex of [ex1,ex2]){ ctx.beginPath(); ctx.arc(X(ex),Y(ey),0.026*u,0,TAU); ctx.fill(); ctx.fillStyle=PAL[0]; ctx.beginPath(); ctx.arc(X(ex+gx),Y(ey+gy),0.013*u,0,TAU); ctx.fill(); ctx.fillStyle=WHITE; }
+    if(f==='slump'){ ctx.fillStyle=PAL[4]; ctx.fillRect(X(ex1-0.03),Y(ey+0.03),0.15*u,0.022*u); ctx.fillStyle=WHITE; }
+  }
+  // mouth: thick white smile
+  const my=hy-0.05, mx=hx+dir*0.015;
+  ctx.lineWidth=0.03*u;
+  if(f==='laugh'){
+    ctx.fillStyle=PAL[0]; ctx.beginPath(); ctx.moveTo(X(mx-0.055),Y(my+0.01)); ctx.quadraticCurveTo(X(mx),Y(my-0.09),X(mx+0.055),Y(my+0.01)); ctx.closePath(); ctx.fill(); ctx.stroke();
+  } else if(f==='wow'){
+    ctx.beginPath(); ctx.ellipse(X(mx),Y(my-0.01),0.022*u,0.03*u,0,0,TAU); ctx.stroke();
+  } else {
+    const d=f==='slump'?0.018:(f==='squint'?0.012:0.035);
+    ctx.beginPath(); ctx.moveTo(X(mx-0.05),Y(my+0.012)); ctx.quadraticCurveTo(X(mx),Y(my-d*1.6),X(mx+0.05),Y(my+0.012)); ctx.stroke();
+  }
+  // cheeks (cool tint only)
+  ctx.globalAlpha=0.55; ctx.fillStyle=PAL[5];
+  ctx.beginPath(); ctx.arc(X(hx-0.085+dir*0.015),Y(hy-0.03),0.018*u,0,TAU); ctx.arc(X(hx+0.085+dir*0.015),Y(hy-0.03),0.018*u,0,TAU); ctx.fill(); ctx.globalAlpha=1;
+}
+function drawRings(){
+  const g=goal(), glowL=(phase==='play'&&!act)?(0.5+0.5*Math.sin(T*5)):(act?0.25:0);
+  // giant ring (stretched while pulling in / planted while swapping)
+  if(ringL.grow>0.01||ringL.giant>0.01){
+    let cx,cy,rx,ry;
+    if(ringL.planted||ringL.giant>0.01){
+      const R=Math.max(0.12,Math.min(farY/2,0.62)), gg=ringL.giant;
+      const hcx=(farX+ringL.hx)/2, hcy=(farY+ringL.hy)/2;
+      cx=lerp(hcx,farX,gg); cy=lerp(hcy,R,gg); rx=lerp(0.2,R,gg); ry=lerp(0.2,R,gg);
+      if(phase==='swap'&&pt>3.6){ const s=ringL.giant; cx=lerp(farX,cx,s); cy=lerp(farY,cy,s); rx=lerp(0.075,rx,s); ry=lerp(0.075,ry,s); }
+    } else {
+      const gg=ringL.grow, dx=ringL.hx-farX, dy=ringL.hy-farY, dist=hyp(dx,dy);
+      cx=(farX+ringL.hx)/2; cy=(farY+ringL.hy)/2; rx=Math.max(0.075,dist/2+0.04)*(1+gg*0.2); ry=Math.max(0.075,0.075+gg*0.45);
+      cy=Math.max(cy,ry*0.98);
+    }
+    ctx.save(); ctx.translate(X(cx),Y(cy));
+    const lw=0.06*h;
+    ctx.lineWidth=lw+0.035*h; ctx.strokeStyle=WHITE; ctx.beginPath(); ctx.ellipse(0,0,rx*h,ry*h,0,0,TAU); ctx.stroke();
+    ctx.lineWidth=lw; ctx.strokeStyle=HEAT[0]; ctx.stroke();
+    ctx.lineWidth=lw*0.55; ctx.strokeStyle=HEAT[1]; ctx.stroke();
+    ctx.lineWidth=lw*0.2; ctx.strokeStyle=HEAT[2]; ctx.stroke();
+    ctx.restore();
+  } else {
+    drawRing(ringL.hx,ringL.hy,ringL.r,ringL.sq,ringL.heat,glowL*(phase==='play'?1:0));
+  }
+  if(phase!=='greet'){ const rb=endR.y; drawRing(ringR.x,phase==='play'?rb:ringR.y,ringR.r,ringR.sq,ringR.heat,0); }
+}
+function drawGreetGloves(){
+  if(phase!=='greet') return;
+  // the one lure: the player's glove pulses, partner's open palm waits
+  const pulse=0.5+0.5*Math.sin(T*5);
+  if(!act){ ctx.save(); ctx.globalAlpha=0.35+0.4*pulse; ctx.strokeStyle=PAL[5]; ctx.lineWidth=0.03*h; ctx.beginPath(); ctx.arc(X(gloveP.x),Y(gloveP.y),(0.16+0.03*pulse)*h,0,TAU); ctx.stroke(); ctx.restore(); }
+}
+function drawParts(){
+  for(const p of parts){
+    const a=1-p.t/p.life;
+    ctx.globalAlpha=Math.min(1,a*1.5);
+    if(p.kind==='heat'){ ctx.fillStyle=HEAT[p.c]; ctx.beginPath(); ctx.arc(X(p.x),Y(p.y),p.s*h*(0.5+a*0.6),0,TAU); ctx.fill(); }
+    else if(p.kind==='conf'){ ctx.save(); ctx.translate(X(p.x),Y(p.y)); ctx.rotate(p.rot); ctx.fillStyle=PAL[3+p.c]; ctx.fillRect(-p.s*h,-p.s*h*0.5,p.s*2*h,p.s*h); ctx.restore(); }
+    else { ctx.fillStyle=p.c===0?WHITE:PAL[4+(p.c&1)]; const s=p.s*h*(0.4+a); ctx.fillRect(X(p.x)-s/2,Y(p.y)-s/2,s,s); }
+  }
+  ctx.globalAlpha=1;
+}
+function drawDemo(){
+  if(!demo.on||!demo.path) return;
+  const P=demo.path, n=P.length-1, t=clamp((demo.t-0.3)/2.2,0,1);
+  const f=t*n, i=Math.min(n-1,f|0), u=ease(f-i);
+  const x=lerp(P[i].x,P[i+1].x,u), y=lerp(P[i].y,P[i+1].y,u);
+  const a=Math.min(1,demo.t*3)*Math.min(1,(2.8-demo.t)*3);
+  ctx.save(); ctx.globalAlpha=0.85*a;
+  // ghost trail
+  ctx.strokeStyle=PAL[5]; ctx.lineWidth=0.02*h; ctx.setLineDash([0.04*h,0.05*h]);
+  ctx.beginPath(); ctx.moveTo(X(P[0].x),Y(P[0].y)); for(let k=1;k<=i;k++) ctx.lineTo(X(P[k].x),Y(P[k].y)); ctx.lineTo(X(x),Y(y)); ctx.stroke(); ctx.setLineDash([]);
+  // fingertip
+  const press=demo.t<0.45?(demo.t-0.3)/0.15:1;
+  ctx.fillStyle=WHITE; ctx.strokeStyle=PAL[1]; ctx.lineWidth=0.015*h;
+  ctx.beginPath(); ctx.arc(X(x),Y(y),(0.07-0.015*clamp(press,0,1))*h,0,TAU); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(X(x+0.03),Y(y-0.2),0.06*h,0.16*h,-0.15,0,TAU); ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+function draw(){
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  drawBG();
+  drawOrnaments();
+  drawSpot();
+  drawChair();
+  drawCloth();
+  // supporters behind rester? draw rester last so seated face is always visible
+  const order=chairOpen>0.5?[sup,res]:[0,1];
+  for(const k of order) drawChar(CH[k]);
+  drawShadow();
+  drawRings();
+  drawGreetGloves();
+  drawParts();
+  drawAudience();
+  drawDemo();
+}
+
+// =====================================================================
+//  loop
+// =====================================================================
+let raf=0, last=0, running=false;
+const perf={n:0,ms:0,down:-1,react:-1};
+function frame(ts){
+  raf=0; if(!running) return;
+  let dt=(ts-last)/1000; last=ts;
+  if(!(dt>0)) dt=1/60; dt=Math.min(dt,1/30);
+  const t0=performance.now();
+  try{ update(dt); draw(); }catch(err){ console.warn(err); }
+  const t1=performance.now(); perf.n++; perf.ms+=t1-t0; if(perf.down>0&&perf.react<0) perf.react=t1-perf.down;
+  raf=requestAnimationFrame(frame);
+}
+function start(){ if(running) return; running=true; last=performance.now(); raf=requestAnimationFrame(frame); }
+function stop(){ running=false; if(raf) cancelAnimationFrame(raf); raf=0; }
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden){ stop(); release(false); if(AC&&AC.state==='running') AC.suspend().catch(()=>{}); }
+  else { if(AC&&audioOn) AC.resume().catch(()=>{}); if(AC) accNext=qNext(EIGHTH); start(); }
+});
+let rzT=0;
+window.addEventListener('resize',()=>{ clearTimeout(rzT); rzT=setTimeout(layout,60); layout(); });
+window.addEventListener('orientationchange',()=>setTimeout(layout,120));
+
+// test/inspection hook (no UI)
+window.__gf={get phase(){return phase;},perf:perf,disc:disc,sub:sub,log:LOG,mem:mem,
+  get info(){return {phase:phase,cycle:cycle,lift:+lift.toFixed(2),tension:+tension.toFixed(2),curtain:curtain,chairHidden:chairHidden,chairOpen:chairOpen,sup:sup,res:res,overpull:+overpull.toFixed(2),shade:shadeOver,parts:parts.length,cc:+((endL.x+endR.x)/2).toFixed(2),goal:goal()};},
+  world(x,y){return {x:X(x),y:Y(y)};},
+  get chars(){return CH.map(c=>({x:+c.x.toFixed(2),tx:+c.tx.toFixed(2),hx:+c.hand.x.toFixed(2),hy:+c.hand.y.toFixed(2),sit:+c.sit.toFixed(2)}));},
+  get targets(){return {glove:{x:X(gloveP.x),y:Y(gloveP.y)},gloveB:{x:X(gloveB.x),y:Y(gloveB.y)},ring:{x:X(ringL.hx),y:Y(ringL.hy)},ringR:{x:X(ringR.x),y:Y(ringR.y)},h:h,Wh:Wh,L0:L0,floorY:floorY,cx:cxS};}};
+
+startCycle(true);
+layout();
+start();
+})();
+</script>
+</body>
+</html>
