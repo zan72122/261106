@@ -1015,7 +1015,7 @@ rafId=requestAnimationFrame(frame);
 window.__gf={
   get T(){return T;},state:()=>({holes:holes.map(h=>({layers:h.layers.slice(),seq:h.seq,flip:h.flipT})),boat:{mode:boat.mode,seat:boat.seat,lvl:boat.lvl,x:boat.x,y:boat.y,lift:boat.lift,departReq:boat.departReq},
     selected,plates:plates.map(cfgSig),shelf:shelf.map(c=>c?cfgSig(c):null),performed,crossing,lowBell,corrLit,storageOK,stats:JSON.parse(JSON.stringify(stats)),parts:parts.length,voices}),
-  notes:()=>notelog.slice(),rides:()=>rideLog.slice(),layout:()=>({holeX:L.holeX,holeY:L.holeY,holeR:L.holeR,trackY:L.trackY,stX:L.stX,trayY:L.trayY,stS:L.stS,dockY:L.dockY,shelfX:L.shelfX,shelfY:L.shelfY,plS:L.plS,bw:L.bw,th:L.th,zone:L.zone,dockX:L.dockX(),boat:boatPos()}),
+  notes:()=>notelog.slice(),rides:()=>rideLog.slice(),layout:()=>({holeX:L.holeX,holeY:L.holeY,holeR:L.holeR,trackY:L.trackY,stX:L.stX,trayY:L.trayY,stS:L.stS,dockY:L.dockY,shelfX:L.shelfX,shelfY:L.shelfY,plS:L.plS,bw:L.bw,th:L.th,zone:L.zone,dockX:L.dockX(),plateXY:L.plateXY,cx:L.cx,boat:boatPos()}),
   audio:()=>AC?AC.state:'none'
 };
 })();
