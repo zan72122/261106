@@ -561,7 +561,7 @@ function deactivateFurn(f,quiet){
   const n=returnItemsForPair(f.a,f.b,f.key);
   if(!quiet){
     sfx.patan(0.9+(f.key==='pm'?0.15:f.key==='bm'?0.3:0));
-    const c=fpos(f,0,0);chips(c.x,c.y,7,[C.grout==='x'?C.white:C.gray,C.white,C.coral]);
+    const c=fpos(f,0,0);chips(c.x,c.y,7,[C.gray,C.white,C.coral]);
     [f.a,f.b].forEach(pi=>{persons[pi].lookFront=0;setMood(persons[pi],1,0.8);});
     foldedKeys[f.key]=1;foldedKeys.__any=1;disc.fold++;if(!cyc.d4&&(cyc.d1||cyc.d2||cyc.d3))cyc.d4=1;
     logEv('fold '+f.key+' returned='+n);
@@ -1171,7 +1171,7 @@ function drawFurn(f,fe){
       for(let k=1;k<n;k++){const w=-L/2+k*L/n;g.beginPath();g.moveTo(-S*0.06,w);g.lineTo(S*0.06,w);g.stroke();}
       g.strokeStyle=C.grout;g.lineWidth=lw;g.strokeRect(-S*0.06,-L/2,S*0.12,L);
       // sound waves through the window
-      if(f.active){const ph=(gt*1.6)%1;g.strokeStyle='rgba(35,153,139,'+(0.6*(1-ph))+')';g.lineWidth=2;const dir=sideOf(f,1);g.beginPath();g.arc(-dir*S*0.02+dir*ph*S*0.1,0,S*0.03+ph*S*0.05,-0.8,0.8);if(dir<0){}g.stroke();}
+      if(f.active){const ph=(gt*1.6)%1;g.strokeStyle='rgba(35,153,139,'+(0.6*(1-ph))+')';g.lineWidth=2;const dir=sideOf(f,1);g.beginPath();g.arc(-dir*S*0.02+dir*ph*S*0.1,0,S*0.03+ph*S*0.05,dir>0?-0.8:PI-0.8,dir>0?0.8:PI+0.8);g.stroke();}
     }else if(kind==='counter'){
       g.scale(1,flipS);
       furnTiles(-S*0.31,-S*0.065,S*0.31,S*0.065,[C.ver,C.coral,C.ver,C.white],7,lw);
