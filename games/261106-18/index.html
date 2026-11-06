@@ -1,0 +1,1445 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#262b26">
+<title>ぱたん、カチッ！すその切れはしでつくるおきがえ舞台</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#262b26;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+canvas{position:fixed;left:0;top:0;display:block;touch-action:none;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;outline:none}
+#sa{position:fixed;left:0;top:0;visibility:hidden;pointer-events:none;padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+(function(){
+'use strict';
+// ====================================================================
+//  helpers / palette (LCD: black-green glass, yellow-green, amber, dark grey)
+// ====================================================================
+const PI=Math.PI, TAU=PI*2;
+const clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+const lerp=(a,b,t)=>a+(b-a)*t;
+const ease=t=>{t=clamp(t,0,1);return t*t*(3-2*t);};
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const COL={
+  body:'#262b26', bodyHi:'#353b34', bodyLo:'#161a16',
+  glass:'#0c1711', glass2:'#13241a',
+  green:'#b9e24e', amber:'#f2b53a', grey:'#3b443b',
+  ghost:'rgba(160,210,110,0.075)', shadow:'rgba(0,0,0,0.5)',
+  padLime:'#d7ec82', padAmber:'#f5c95a', padPale:'#d3ddc6', ink:'#1b211b'
+};
+const cv=document.getElementById('c');
+const cx=cv.getContext('2d');
+const saEl=document.getElementById('sa');
+
+// LCD logical size
+const LW=400, LH=260;
+const FLOOR=200, LAND=120, STH=28;
+const TYPES=['b','s','p']; // b: coat->bridge, s: skirt->stairs, p: pants->stools
+
+// ====================================================================
+//  layout
+// ====================================================================
+let W=1,H=1,DPR=1;
+const Lo={lx:0,ly:0,lw:400,lh:260,k:1,px:0,py:0,pw:100,ph:100,bw:80,bh:100,portrait:true};
+function layout(){
+  W=Math.max(1,window.innerWidth); H=Math.max(1,window.innerHeight);
+  DPR=Math.min(2,window.devicePixelRatio||1);
+  cv.width=Math.round(W*DPR); cv.height=Math.round(H*DPR);
+  cv.style.width=W+'px'; cv.style.height=H+'px';
+  const cs=getComputedStyle(saEl);
+  const st=parseFloat(cs.paddingTop)||0, sr=parseFloat(cs.paddingRight)||0,
+        sb=parseFloat(cs.paddingBottom)||0, sl=parseFloat(cs.paddingLeft)||0;
+  const ax=sl, ay=st, aw=W-sl-sr, ah=H-st-sb;
+  const m=clamp(Math.min(aw,ah)*0.03,8,24);
+  const portrait=ah>aw*1.05;
+  let lw,lh;
+  if(portrait){
+    lw=aw-2*m; lh=lw*LH/LW;
+    if(lh>ah*0.52){lh=ah*0.52; lw=lh*LW/LH;}
+  }else{
+    lh=Math.min(ah*0.64,(aw-2*m)*LH/LW); lw=lh*LW/LH;
+  }
+  Lo.portrait=portrait;
+  Lo.lw=lw; Lo.lh=lh; Lo.k=lw/LW;
+  Lo.lx=ax+(aw-lw)/2; Lo.ly=ay+m+(portrait?Math.min(ah*0.03,30):0);
+  Lo.px=ax+m; Lo.pw=aw-2*m; Lo.py=Lo.ly+lh+m*1.4; Lo.ph=ay+ah-m-Lo.py;
+  const slotW=Lo.pw/3;
+  let bh=Math.min(Lo.ph*0.8, slotW*1.5);
+  let bw=Math.min(slotW*0.84, bh*0.92);
+  bh=Math.min(bh,bw*1.45);
+  Lo.bw=bw; Lo.bh=bh;
+  if(portrait){
+    // keep the composition together and centred instead of a huge empty tray
+    const need=Math.min(Lo.ph,bh*1.4+2*m);
+    const spare=Lo.ph-need;
+    Lo.ph=need;
+    const off=spare*0.45;
+    Lo.ly+=off; Lo.py+=off;
+  }
+  if(drag) cancelDrag();
+}
+
+// ====================================================================
+//  audio (Web Audio synthesis, created on first touch)
+// ====================================================================
+let AC=null, master=null, noiseBuf=null, audioWanted=false;
+function audioInit(){
+  audioWanted=true;
+  try{
+    if(!AC){
+      const C=window.AudioContext||window.webkitAudioContext; if(!C) return;
+      AC=new C(); master=AC.createGain(); master.gain.value=0.55; master.connect(AC.destination);
+      const n=Math.floor(AC.sampleRate*0.5); noiseBuf=AC.createBuffer(1,n,AC.sampleRate);
+      const d=noiseBuf.getChannelData(0); for(let i=0;i<n;i++) d[i]=Math.random()*2-1;
+    }
+    if(AC.state==='suspended' && !document.hidden) AC.resume().catch(()=>{});
+    if(!AC.__unlocked){ AC.__unlocked=true; const s=AC.createBufferSource(); s.buffer=AC.createBuffer(1,1,22050); s.connect(AC.destination); s.start(0); }
+  }catch(e){}
+}
+function tone(f,dur,type,vol,delay,slide){
+  if(!AC||AC.state!=='running') return;
+  try{
+    const t=AC.currentTime+(delay||0);
+    const o=AC.createOscillator(), g=AC.createGain();
+    o.type=type||'square'; o.frequency.setValueAtTime(f,t);
+    if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(30,f*slide),t+dur);
+    g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(vol||0.1,t+0.006);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+    o.connect(g); g.connect(master); o.start(t); o.stop(t+dur+0.02);
+  }catch(e){}
+}
+function noise(dur,vol,delay,freq,q){
+  if(!AC||AC.state!=='running'||!noiseBuf) return;
+  try{
+    const t=AC.currentTime+(delay||0);
+    const s=AC.createBufferSource(); s.buffer=noiseBuf;
+    const f=AC.createBiquadFilter(); f.type='bandpass'; f.frequency.value=freq||1200; f.Q.value=q||1.2;
+    const g=AC.createGain(); g.gain.setValueAtTime(vol||0.2,t); g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+    s.connect(f); f.connect(g); g.connect(master); s.start(t); s.stop(t+dur+0.02);
+  }catch(e){}
+}
+const SFX={
+  press(){ tone(180,0.07,'triangle',0.22,0,0.6); noise(0.03,0.12,0,2600,2); },
+  click(f){ tone(f,0.025,'square',0.07); },
+  patan(){ noise(0.06,0.35,0,700,0.8); tone(110,0.09,'triangle',0.3,0,0.5); noise(0.05,0.28,0.09,500,0.8); tone(90,0.1,'triangle',0.25,0.09,0.5); },
+  step(f){ tone(f||900,0.018,'square',0.035); },
+  jump(h){ tone(330+h*8,0.12,'triangle',0.12,0,1.9); },
+  land(){ noise(0.04,0.12,0,400,1); },
+  success(type){ const b={b:523,s:659,p:784}[type]||600; tone(b,0.07,'square',0.08,0); tone(b*1.5,0.07,'square',0.08,0.07); tone(b*2,0.12,'square',0.08,0.14); },
+  fanfare(order){ const map={b:523,s:659,p:784}; let d=0; for(const o of order){ tone(map[o],0.11,'square',0.09,d); d+=0.12; } tone(1047,0.22,'square',0.09,d); tone(1319,0.3,'square',0.07,d+0.12); tone(1568,0.45,'square',0.07,d+0.24); },
+  flip(){ for(let i=0;i<8;i++) tone(400+i*90,0.03,'square',0.06,i*0.05); noise(0.35,0.08,0,1800,0.7); },
+  fold(){ for(let i=0;i<7;i++) tone(1100-i*110,0.03,'square',0.06,i*0.06); },
+  lamp(){ tone(1568,0.25,'sine',0.12); tone(2093,0.35,'sine',0.08,0.06); },
+  give(){ tone(880,0.06,'square',0.08); tone(1175,0.1,'square',0.08,0.07); },
+  cancel(){ tone(300,0.12,'triangle',0.12,0,1.6); },
+  hat(){ tone(700,0.08,'triangle',0.12,0,1.5); tone(1050,0.12,'triangle',0.1,0.08,1.3); },
+  note(f){ tone(f,0.14,'triangle',0.11); }
+};
+
+// ====================================================================
+//  persistence (album) - optional, fully guarded
+// ====================================================================
+const SKEY='gf261106-18-album';
+let album=[];
+function validEntry(e){
+  if(!e||typeof e!=='object') return false;
+  if(typeof e.o!=='string'||e.o.length!==3) return false;
+  const s=e.o.split('').sort().join(''); if(s!=='bps') return false;
+  if(e.h!==0&&e.h!==1) return false;
+  return true;
+}
+function loadAlbum(){
+  try{
+    const raw=window.localStorage.getItem(SKEY); if(!raw) return [];
+    const a=JSON.parse(raw); if(!Array.isArray(a)) return [];
+    return a.filter(validEntry).slice(-6).map(e=>({o:e.o,h:e.h}));
+  }catch(e){ return []; }
+}
+function saveAlbum(){ try{ window.localStorage.setItem(SKEY,JSON.stringify(album)); }catch(e){} }
+album=loadAlbum();
+
+// ====================================================================
+//  stage state
+// ====================================================================
+const S={};
+const history={orders:{}, starts:[]};
+const visits={};
+let padOrder=['b','s','p'];
+const padPos={b:0,s:1,p:2};
+const padAnim={b:{press:0,raise:0,cx:0,wob:0},s:{press:0,raise:0,cx:0,wob:0},p:{press:0,raise:0,cx:0,wob:0}};
+let stageCount=0, undressCount=0, hatSince=0;
+// restored album steers the suggested order toward ones not yet made
+for(const e of album) history.orders[e.o]=(history.orders[e.o]||0)+1;
+if(Object.keys(history.orders).length>=6) history.orders={};
+function resetStage(first){
+  S.has={b:false,s:false,p:false};
+  S.prog={b:0,s:0,p:0};
+  S.order=[];
+  S.lamp=0; S.lampFlick=0;
+  S.stoolL='floor'; S.stoolR='floor';
+  S.stoolLp={x:48,y:FLOOR}; S.stoolRp={x:340,y:FLOOR};
+  S.home=first?336:Math.round(rnd(304,352));
+  S.stoolRx=S.home<330?S.home+30:S.home-34;
+  S.stoolRp.x=S.stoolRx;
+  S.connected=false; S.flip=null; S.flipped=false; S.box=null; S.plankOut=null;
+  S.seams=[]; S.hems=[]; S.duet=null; S.big=false; S.bigT=-1; S.memo=false; S.memoT=-1; S.memoNew=-1;
+  S.hat=false; S.posing=0; S.lightPat=0; S.call=0;
+  if(!first){
+    // shuffle pad order (positions animate)
+    const a=TYPES.slice(); for(let i=2;i>0;i--){const j=Math.floor(Math.random()*(i+1)); const t=a[i];a[i]=a[j];a[j]=t;}
+    padOrder=a;
+  }
+  padOrder.forEach((t,i)=>padPos[t]=i);
+}
+resetStage(true);
+S.next='b'; S.fold=null; S.rise=null; S.pendingWear=null;
+
+function triedPrefix(prefix){ // permutations not yet completed which start with prefix
+  const perms=['bsp','bps','sbp','spb','pbs','psb'].filter(p=>p.startsWith(prefix));
+  return perms.filter(p=>!history.orders[p]);
+}
+function suggestStart(){
+  let c=TYPES.filter(t=>triedPrefix(t).length>0); if(!c.length) c=TYPES.slice();
+  const last=history.starts[history.starts.length-1]; const c2=c.filter(t=>t!==last); if(c2.length) c=c2;
+  return c[Math.floor(Math.random()*c.length)];
+}
+function suggestNext(){
+  const pre=S.order.join('');
+  const rem=TYPES.filter(t=>!S.has[t]);
+  if(!rem.length) return null;
+  let cand=rem.filter(t=>triedPrefix(pre+t).length>0);
+  if(!cand.length) cand=rem;
+  if(!pre && cand.length>1 && history.starts.length){ const last=history.starts[history.starts.length-1]; const c2=cand.filter(t=>t!==last); if(c2.length) cand=c2; }
+  return cand[Math.floor(Math.random()*cand.length)];
+}
+
+// ====================================================================
+//  navigation graph
+// ====================================================================
+function nodePos(id){
+  switch(id){
+    case 'RF': return [S.home,FLOOR];
+    case 'RE': return [290,FLOOR];
+    case 'BM': return [196,FLOOR];
+    case 'LE': return [110,FLOOR];
+    case 'SF': return [86,FLOOR];
+    case 'LF': return [66,FLOOR];
+    case 'S1': return [99,180];
+    case 'S2': return [113,160];
+    case 'S3': return [127,140];
+    case 'S4': return [144,LAND];
+    case 'LA': return [182,LAND];
+    case 'LR': return [210,LAND];
+    case 'LS': return S.stoolL==='land'?[226,LAND-STH]:[48,FLOOR-STH];
+    case 'RS': return S.stoolR==='bridge'?[252,FLOOR-STH]:[S.stoolRx,FLOOR-STH];
+  }
+  return [66,FLOOR];
+}
+function edgeList(){
+  const e=[['RF','RE'],['LE','SF'],['SF','LF']];
+  if(S.has.b && S.prog.b>0.95) e.push(['RE','BM'],['BM','LE']);
+  if(S.has.s && S.prog.s>0.95) e.push(['SF','S1'],['S1','S2'],['S2','S3'],['S3','S4'],['S4','LA'],['LA','LR']);
+  if(S.has.p && S.prog.p>0.95){
+    e.push(S.stoolL==='land'?['LA','LS']:['LF','LS']);
+    e.push(S.stoolR==='bridge'?['BM','RS']:['RF','RS']);
+  }
+  return e;
+}
+const GIRL_NO={RF:1,RE:1,BM:1,RS:1};
+const DRESS_NO={LS:1,LR:1};
+function findPath(c,from,to){
+  if(from===to) return [];
+  const e=edgeList(), adj={};
+  const no=c.kind==='g'?GIRL_NO:DRESS_NO;
+  for(const [a,b] of e){ if(no[a]||no[b]) continue; (adj[a]=adj[a]||[]).push(b); (adj[b]=adj[b]||[]).push(a); }
+  const prev={}; prev[from]=null; const q=[from];
+  while(q.length){ const n=q.shift(); if(n===to) break; for(const m of (adj[n]||[])){ if(!(m in prev)){prev[m]=n;q.push(m);} } }
+  if(!(to in prev)) return null;
+  const p=[]; let n=to; while(n!==from){p.unshift(n); n=prev[n];}
+  return p;
+}
+function edgeExists(a,b){ for(const [x,y] of edgeList()) if((x===a&&y===b)||(x===b&&y===a)) return true; return false; }
+function reachable(c){
+  const out=[]; const all=['RF','RE','BM','LE','SF','LF','S1','S2','S3','S4','LA','LR','LS','RS'];
+  for(const n of all){ if(n===c.node) continue; const p=findPath(c,c.node,n); if(p) out.push(n); }
+  return out;
+}
+
+// ====================================================================
+//  characters
+// ====================================================================
+function mkChar(kind,node){
+  const p=nodePos(node);
+  return {kind,node,x:p[0],y:p[1],leg:null,path:[],q:[],act:null,face:kind==='g'?1:-1,ph:0,carry:null,
+    sx:p[0],sy:p[1],after:[],idleT:1.2,expr:'smile',walkPh:0,lookX:0,lookY:0,pose:0};
+}
+const girl=mkChar('g','LF');
+const dress=mkChar('d','RF');
+girl.garment=null;
+
+function startLeg(c,to,opts){
+  const p=nodePos(to); opts=opts||{};
+  const dx=p[0]-c.x, dy=p[1]-c.y, dist=Math.hypot(dx,dy);
+  let jump=opts.jump, h=opts.h||0, dur;
+  const stair=/^S\d$/.test(to)||/^S\d$/.test(c.node);
+  if(jump===undefined) jump=(to==='LS'||to==='RS'||c.node==='LS'||c.node==='RS');
+  if(jump){ dur=opts.dur||0.42; h=h||14; }
+  else if(stair){ jump=true; h=5; dur=0.24; }
+  else{
+    let sp=c.kind==='g'?(girl.garment==='b'?66:52):76;
+    if(S.big) sp*=1.25;
+    dur=Math.max(0.12,dist/sp);
+  }
+  if(dx!==0) c.face=dx>0?1:-1;
+  c.leg={x0:c.x,y0:c.y,x1:p[0],y1:p[1],t:0,dur,jump,h,to};
+  if(jump) SFX.jump(h);
+}
+function hopTo(c,node,h){
+  c.path=[]; c.q=[]; c.act=null;
+  const p=nodePos(node);
+  const d=Math.hypot(p[0]-c.x,p[1]-c.y);
+  c.leg={x0:c.x,y0:c.y,x1:p[0],y1:p[1],t:0,dur:clamp(d/220,0.3,0.7),jump:true,h:h||Math.max(14,d*0.25),to:node};
+  if(p[0]!==c.x) c.face=p[0]>c.x?1:-1;
+  SFX.jump(10);
+}
+function goTo(c,node){ c.q.push({go:node}); }
+function replaceQ(c,list){ c.q=list.slice(); c.path=[]; c.act=null; c.idleT=0.6; }
+function visit(c,node){
+  const k=node; visits[k]=(visits[k]||0)+1;
+  const p=nodePos(node); lampPulse(p[0]);
+}
+
+function updChar(c,dt){
+  c.ph+=dt;
+  if(c.leg){
+    const L=c.leg; L.t+=dt; const u=clamp(L.t/L.dur,0,1);
+    c.x=lerp(L.x0,L.x1,u); c.y=lerp(L.y0,L.y1,u);
+    if(L.jump) c.y-=Math.sin(u*PI)*L.h;
+    else c.walkPh+=dt*(c.kind==='g'&&girl.garment==='b'?7:10);
+    if(u>=1){
+      c.node=L.to; c.x=L.x1; c.y=L.y1; c.leg=null; visit(c,c.node);
+      if(L.jump) SFX.land(); else SFX.step(c.kind==='g'?1300:900);
+    }
+    return;
+  }
+  if(c.act){
+    c.act.t+=dt;
+    if(c.act.name==='jump'||c.act.name==='stomp'){ /* visual only */ }
+    if(c.act.t>=c.act.dur){ const a=c.act; c.act=null; if(a.end) a.end(); }
+    return;
+  }
+  if(c.path.length){
+    const nx=c.path[0];
+    if(!edgeExists(c.node,nx)){ c.path=[]; return; }
+    c.path.shift(); startLeg(c,nx); return;
+  }
+  if(c.q.length){
+    const a=c.q.shift();
+    if(a.go){ const p=findPath(c,c.node,a.go); if(p) c.path=p; }
+    else if(a.act){ c.act={name:a.act,t:0,dur:a.dur||0.5,end:a.end}; if(a.act==='jump') SFX.jump(8); }
+    else if(a.wait){ c.act={name:'wait',t:0,dur:a.wait}; }
+    else if(a.fn){ a.fn(); }
+    return;
+  }
+  // idle
+  c.idleT-=dt;
+  if(c.idleT>0) return;
+  if(S.big||S.fold) { c.idleT=0.5; return; }
+  if(S.duet){ c.idleT=0.2; return; }
+  if(c.kind==='g') girlIdle(c); else dressIdle(c);
+}
+function girlIdle(c){
+  const g=girl.garment;
+  if(g==='b'){
+    // big strides on her side
+    const opts=['LF','LE','SF'].filter(n=>n!==c.node);
+    if(c.node==='LA'||/^S/.test(c.node)) opts.push('S4','LA');
+    const t=opts[Math.floor(Math.random()*opts.length)];
+    goTo(c,t); c.q.push({wait:rnd(0.6,1.2)}); c.idleT=0.2;
+  }else if(g==='s'){
+    c.q.push({act:'spin',dur:1.1},{wait:rnd(0.7,1.4)}); c.idleT=0.2;
+  }else if(g==='p'){
+    if(S.has.p && Math.random()<0.5 && findPath(c,c.node,'LS')){ goTo(c,'LS'); c.q.push({act:'jump',dur:0.45},{act:'jump',dur:0.45}); }
+    else c.q.push({act:'jump',dur:0.45},{wait:rnd(0.5,1.2)});
+    c.idleT=0.2;
+  }else{
+    c.q.push({act:'bob',dur:0.8}); c.idleT=rnd(1.2,2.2);
+  }
+}
+function dressIdle(c){
+  if(!S.order.length && !S.fold){
+    if(c.node!=='RF'){ goTo(c,'RF'); c.idleT=0.3; return; }
+    c.q.push({act:'wave',dur:1.4}); c.idleT=rnd(0.4,1.0); return;
+  }
+  const r=reachable(c).filter(n=>!/^S[123]$/.test(n));
+  if(!r.length){ c.q.push({act:'wave',dur:1}); c.idleT=1; return; }
+  r.sort((a,b)=>(visits[a]||0)-(visits[b]||0)+(Math.random()-0.5)*1.5);
+  goTo(c,r[0]);
+  c.q.push({act:r[0]==='RS'?'jump':'wave',dur:0.6},{wait:rnd(1.4,2.8)});
+  c.idleT=0.2;
+}
+
+// ====================================================================
+//  effects & particles
+// ====================================================================
+const parts=[]; const MAXP=48;
+function shards(x,y,n,col){
+  for(let i=0;i<n;i++){
+    if(parts.length>=MAXP) parts.shift();
+    const a=rnd(0,TAU), s=rnd(30,90);
+    parts.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-40,a:rnd(0,PI),va:rnd(-8,8),life:rnd(0.4,0.8),t:0,col:col||1,len:rnd(3,6)});
+  }
+}
+const topLamps=new Array(12).fill(0); // pulse
+function lampIndex(x){ return clamp(Math.floor((x-14)/31),0,11); }
+function lampPulse(x){ topLamps[lampIndex(x)]=1; }
+function lampLevel(i){
+  // memory of visited places
+  let v=0;
+  for(const k in visits){ const p=nodePos(k); if(lampIndex(p[0])===i) v+=visits[k]; }
+  return v>=14?3:v>=6?2:v>=2?1:0;
+}
+
+// ====================================================================
+//  core actions: wear / build / connect / undress
+// ====================================================================
+let idleT=0, everInput=false, demo=null, demoDone=false, lureUndress=false;
+function wear(type){
+  if(S.fold){ S.pendingWear=type; return; }
+  if(S.big && !S.memo){ forceMemo(); return; } // impatient tap: finish the pose into the album first
+  if(S.memo){ S.pendingWear=type; startFold(true); return; }
+  girl.garment=type; girl.expr='open';
+  setTimeout(()=>{ if(girl.expr==='open') girl.expr='smile'; },900);
+  shards(girl.x,girl.y-22,6,2);
+  padAnim[type].raise=0;
+  if(S.rise && S.rise.type===type) S.rise=null;
+  if(!S.has[type]){
+    S.has[type]=true; S.prog[type]=0;
+    if(!S.order.length) history.starts.push(type);
+    S.next=null;
+    startHem(type);
+  }else{
+    // re-wear: hem flicks, motion style changes, platform stays
+    SFX.click(1200); SFX.click(1500);
+    S.hems.push({type,pts:[[girl.x,girl.y-4],[girl.x+girl.face*14,girl.y+2]],t:0,dur:0.25,flick:true});
+    if(S.next===type) S.next=suggestNext();
+  }
+  replaceQ(girl,[]);
+  girl.idleT=0.3;
+}
+function hemPath(type){
+  const gx=girl.x, gy=girl.y-4;
+  if(type==='b') return [[[gx,gy],[gx+8,FLOOR],[116,FLOOR],[274,FLOOR]]];
+  if(type==='s') return [[[gx,gy],[86,FLOOR],[92,180],[106,180],[106,160],[120,160],[120,140],[134,140],[134,LAND],[236,LAND]]];
+  // pants: two stools
+  const l=S.has.s?[226,LAND]:[48,FLOOR], r=S.has.b?[252,FLOOR]:[S.stoolRx,FLOOR];
+  return [[[gx,gy],[l[0],l[1]-STH]],[[gx,gy],[gx,gy+2],[r[0],gy+2],[r[0],r[1]-STH]]];
+}
+function polyLen(p){ let s=0; for(let i=1;i<p.length;i++) s+=Math.hypot(p[i][0]-p[i-1][0],p[i][1]-p[i-1][1]); return s; }
+function startHem(type){
+  const paths=hemPath(type);
+  for(let i=0;i<paths.length;i++){
+    const pts=paths[i]; const len=polyLen(pts);
+    S.hems.push({type,pts,len,t:0,dur:clamp(len/260,0.45,1.0),lastSeg:-1,main:i===0,build:i===0});
+  }
+}
+function updHems(dt){
+  for(let i=S.hems.length-1;i>=0;i--){
+    const h=S.hems[i]; h.t+=dt;
+    const u=clamp(h.t/h.dur,0,1);
+    if(!h.flick){
+      const seg=Math.floor(u*h.len/9);
+      if(seg!==h.lastSeg){
+        h.lastSeg=seg;
+        // pitch: length and height
+        const pt=pointAt(h.pts,u);
+        const f=420+seg*38+(FLOOR-pt[1])*6;
+        SFX.click(f);
+      }
+    }
+    if(u>=1){
+      S.hems.splice(i,1);
+      if(h.build){ S.prog[h.type]=0.001; S.building=S.building||{}; S.building[h.type]=0; SFX.patan(); const e=h.pts[h.pts.length-1]; shards(e[0],e[1],6,2); }
+    }
+  }
+  // platform unfold
+  for(const t of TYPES){
+    if(S.has[t] && S.prog[t]>0 && S.prog[t]<1){
+      S.prog[t]=Math.min(1,S.prog[t]+dt/0.45);
+      if(S.prog[t]>=1) onBuilt(t);
+    }
+  }
+}
+function pointAt(pts,u){
+  const L=polyLen(pts)*u; let s=0;
+  for(let i=1;i<pts.length;i++){
+    const d=Math.hypot(pts[i][0]-pts[i-1][0],pts[i][1]-pts[i-1][1]);
+    if(s+d>=L){ const v=d?(L-s)/d:0; return [lerp(pts[i-1][0],pts[i][0],v),lerp(pts[i-1][1],pts[i][1],v)]; }
+    s+=d;
+  }
+  return pts[pts.length-1];
+}
+function partialPoly(pts,u){
+  const L=polyLen(pts)*u; let s=0; const out=[pts[0]];
+  for(let i=1;i<pts.length;i++){
+    const d=Math.hypot(pts[i][0]-pts[i-1][0],pts[i][1]-pts[i-1][1]);
+    if(s+d>=L){ const v=d?(L-s)/d:0; out.push([lerp(pts[i-1][0],pts[i][0],v),lerp(pts[i-1][1],pts[i][1],v)]); return out; }
+    out.push(pts[i]); s+=d;
+  }
+  return out;
+}
+
+function moveStool(side,dest){
+  if(side==='L'){
+    S.stoolL=dest; const p=dest==='land'?{x:226,y:LAND}:{x:48,y:FLOOR};
+    S.stoolLmove={x0:S.stoolLp.x,y0:S.stoolLp.y,x1:p.x,y1:p.y,t:0};
+    if(girl.node==='LS'){ hopTo(girl,dest==='land'?'LA':'LF'); }
+  }else{
+    S.stoolR=dest; const p=dest==='bridge'?{x:252,y:FLOOR}:{x:S.stoolRx,y:FLOOR};
+    S.stoolRmove={x0:S.stoolRp.x,y0:S.stoolRp.y,x1:p.x,y1:p.y,t:0};
+    if(dress.node==='RS'){ hopTo(dress,dest==='bridge'?'BM':'RF'); }
+  }
+  SFX.patan();
+}
+function addSeam(x,y){ S.seams.push({x,y,t:0}); shards(x,y,5,1); }
+
+function onBuilt(type){
+  S.order.push(type);
+  SFX.success(type);
+  const n=S.order.length;
+  const has=S.has;
+  // stools connect to existing platforms
+  if(type==='p'){
+    S.stoolL=has.s?'land':'floor'; S.stoolR=has.b?'bridge':'floor';
+    S.stoolLp=has.s?{x:226,y:LAND}:{x:48,y:FLOOR};
+    S.stoolRp=has.b?{x:252,y:FLOOR}:{x:S.stoolRx,y:FLOOR};
+  }else if(has.p){
+    if(type==='s' && S.stoolL!=='land') moveStool('L','land');
+    if(type==='b' && S.stoolR!=='bridge') moveStool('R','bridge');
+  }
+  S.lightPat=(S.lightPat*3+TYPES.indexOf(type)+1)%7;
+  if(n===1){
+    if(type==='b'){ // dresser crosses the new bridge and delivers the next costume
+      const nx=suggestNext();
+      replaceQ(dress,[{go:'BM'},{go:'LE'},{fn:()=>{dress.carry=nx;}},{act:'give',dur:0.7,end:()=>{dress.carry=null; deliver(nx);}},{wait:0.8}]);
+      replaceQ(girl,[{go:'LF'},{act:'bob',dur:0.6}]);
+      dress.carry=nx; // visible on the way across
+    }else if(type==='s'){
+      replaceQ(girl,[{go:'LA'},{act:'reach',dur:1.2,end:()=>{ S.lampFlick=0.8; SFX.note(1400); }},{act:'spin',dur:1.1},{fn:()=>deliver(suggestNext())}]);
+      replaceQ(dress,[{act:'wave',dur:1.2}]);
+    }else{
+      startDuet('jump',5.5,()=>deliver(suggestNext()));
+      replaceQ(girl,[{go:'LS'}]); replaceQ(dress,[{go:'RS'}]);
+    }
+  }else{
+    connectReact(type);
+    if(n===2 && !S.connected){ S.connected=true; startFlip(); }
+    if(n===3){ S.bigT=3.2; S.next=null; }
+  }
+}
+function connectReact(type){
+  const has=S.has;
+  if(type==='s' && has.b){
+    // bridge -> stairs: dresser walks from bridge to stairs and turns on the light
+    addSeam(92,FLOOR);
+    replaceQ(girl,[{go:'LA'},{act:'reach',dur:0.8,end:()=>{S.lampFlick=0.5;}},{go:'LR'},{act:'spin',dur:1.0}]);
+    replaceQ(dress,[{go:'SF'},{act:'stomp',dur:0.5,end:()=>{SFX.patan();shards(92,FLOOR,5,2);}},{go:'S4'},{wait:0.4},{go:'LA'},{act:'reach',dur:0.9,end:()=>lampOn(1)},{act:'wave',dur:0.8}]);
+  }
+  if(type==='b' && has.s){
+    // stairs -> bridge: two-level stage, call & response
+    addSeam(116,FLOOR);
+    replaceQ(girl,[{go:'LA'},{act:'spin',dur:0.8}]);
+    replaceQ(dress,[{go:'LE'},{act:'stomp',dur:0.5,end:()=>{SFX.patan();shards(116,FLOOR,5,2);}},{go:'BM'}]);
+    startDuet('call',6.5);
+  }
+  if(type==='p'){
+    if(has.s){ addSeam(226,LAND); replaceQ(girl,[{go:'LS'},{act:'reach',dur:0.9,end:()=>lampOn(2)},{act:'jump',dur:0.45}]); }
+    else replaceQ(girl,[{go:'LS'}]);
+    if(has.b){ addSeam(252,FLOOR); replaceQ(dress,[{go:'BM'},{act:'stomp',dur:0.5,end:()=>SFX.patan()},{go:'RS'}]); }
+    else replaceQ(dress,[{go:'RS'}]);
+    S.duetAfter=has.s?2.2:0.6;
+    startDuet('jump',5.5);
+  }
+  if(type==='s' && has.p && !has.b){
+    addSeam(226,LAND);
+    replaceQ(girl,[{go:'LA'},{go:'LS'},{act:'reach',dur:0.9,end:()=>lampOn(2)},{act:'jump',dur:0.45}]);
+    replaceQ(dress,[{go:'RS'},{act:'jump',dur:0.45},{act:'jump',dur:0.45}]);
+  }
+  if(type==='b' && has.p && !has.s){
+    addSeam(252,FLOOR);
+    replaceQ(dress,[{go:'BM'},{act:'stomp',dur:0.5,end:()=>SFX.patan()},{go:'RS'}]);
+    replaceQ(girl,[{go:'LS'}]);
+    startDuet('jump',5);
+  }
+}
+function lampOn(by){
+  if(S.lamp) { S.lampFlick=0.4; return; }
+  S.lamp=by; SFX.lamp(); shards(196,44,8,2);
+  if(by===2) girl.expr='open';
+}
+function startDuet(kind,dur,end){
+  S.duet={kind,t:0,beat:-1,dur,end,wait:S.duetAfter||0};
+  S.duetAfter=0;
+}
+function updDuet(dt){
+  const d=S.duet; if(!d) return;
+  if(d.wait>0){ d.wait-=dt; return; }
+  if(girl.leg||dress.leg||girl.path.length||dress.path.length||girl.q.length||dress.q.length){ return; }
+  d.t+=dt;
+  const b=Math.floor(d.t/0.55);
+  if(b!==d.beat){
+    d.beat=b;
+    const g=(b%2===0);
+    if(d.kind==='jump'){
+      const c=g?girl:dress; c.act={name:'jump',t:0,dur:0.45};
+      SFX.note((g?660:440)*(1+(FLOOR-c.y)/400));
+    }else{
+      if(g){ girl.act={name:'spin',t:0,dur:0.5}; SFX.note(880*(1+(FLOOR-girl.y)/300)); }
+      else { dress.act={name:'stomp',t:0,dur:0.45}; SFX.note(330); noise(0.04,0.15,0,500,1); }
+      S.call=g?1:2;
+    }
+  }
+  if(d.t>=d.dur){ S.duet=null; S.call=0; if(d.end) d.end(); }
+}
+function deliver(type){
+  if(!type||S.big||S.fold) return;
+  if(S.has[type]){ type=suggestNext(); if(!type) return; }
+  S.next=type; padAnim[type].raise=1; SFX.give();
+}
+
+// partition flip + board -> costume box carrying the remaining costume
+function startFlip(){
+  S.flip={t:0}; SFX.flip();
+  const src=S.order[0];
+  let p;
+  if(src==='b') p={x:196,y:FLOOR+10};
+  else if(src==='s') p={x:226,y:LAND+6};
+  else p={x:S.stoolRp.x,y:S.stoolRp.y-14};
+  const rem=TYPES.find(t=>!S.has[t]);
+  S.box={t:0,src,x0:p.x,y0:p.y,x:p.x,y:p.y,type:rem,phase:0};
+}
+function updFlip(dt){
+  if(S.flip){ S.flip.t+=dt; if(S.flip.t>=0.7){ S.flip=null; S.flipped=true; SFX.patan(); shards(380,165,6,1);} }
+  const B=S.box; if(!B) return;
+  B.t+=dt;
+  // phases: 0 wait(0.6) 1 fold into box(0.5) 2 travel to girl(1.1) 3 pop costume(0.4) 4 travel back(0.9) 5 unfold(0.4)
+  const D=[0.6,0.5,1.1,0.45,0.9,0.4];
+  while(B.phase<6 && B.t>=D[B.phase]){
+    B.t-=D[B.phase]; B.phase++;
+    if(B.phase===1){ SFX.fold(); }
+    if(B.phase===2){ B.tx=girl.x+(girl.x<100?18:-18); B.ty=girl.y; B.sx=B.x0; B.sy=B.y0; }
+    if(B.phase===3){ SFX.give(); shards(B.x,B.y-10,6,2); deliver(B.type); maybeHat(0.45); }
+    if(B.phase===4){ }
+    if(B.phase===5){ SFX.patan(); }
+    if(B.phase===6){ S.box=null; shards(B.x0,B.y0,4,2); return; }
+  }
+  if(B.phase===2){ const u=ease(B.t/D[2]); B.x=lerp(B.sx,B.tx,u); B.y=lerp(B.sy,B.ty,u)-Math.sin(u*PI)*18; }
+  if(B.phase===4){ const u=ease(B.t/D[4]); B.x=lerp(B.tx,B.x0,u); B.y=lerp(B.ty,B.y0,u)-Math.sin(u*PI)*18; }
+}
+function maybeHat(p){
+  if(S.hat) return;
+  hatSince++;
+  if(Math.random()<p || hatSince>=4){ S.hat=true; S.hatT=0; hatSince=0; SFX.hat(); }
+}
+
+// big stage with all three hems
+function startBig(){
+  S.big=true; S.duet=null;
+  replaceQ(girl,[{go:'LS'},{fn:()=>{girl.act={name:'pose',t:0,dur:999}; S.posing|=1;}}]);
+  replaceQ(dress,[{go:'RS'},{fn:()=>{dress.act={name:'pose',t:0,dur:999}; S.posing|=2;}}]);
+  S.bigWait=0;
+  lampOn(S.lamp||1);
+}
+function updBig(dt){
+  if(S.bigT>0){ S.bigT-=dt; if(S.bigT<=0 && !S.big && !S.fold) startBig(); }
+  if(S.big && !S.memo){
+    S.bigWait+=dt;
+    if(S.posing===3 && S.memoT<0){ S.memoT=3.6; SFX.fanfare(S.order); girl.expr='open'; for(let i=0;i<10;i++) shards(rnd(100,300),rnd(40,120),1,i%2?1:2); }
+    if(S.bigWait>9 && S.memoT<0){ // safety: force pose
+      girl.act={name:'pose',t:0,dur:999}; dress.act={name:'pose',t:0,dur:999}; S.posing=3;
+    }
+    if(S.memoT>0){ S.memoT-=dt; if(S.memoT<=0) startMemo(); }
+  }
+}
+function forceMemo(){
+  if(S.memo) return;
+  if(S.memoT<0){ SFX.fanfare(S.order); girl.act={name:'pose',t:0,dur:999}; dress.act={name:'pose',t:0,dur:999}; S.posing=3; }
+  S.memoT=-1; startMemo();
+}
+function startMemo(){
+  S.memo=true; S.memoClock=0;
+  const o=S.order.join('');
+  history.orders[o]=(history.orders[o]||0)+1;
+  album.push({o,h:S.hat?1:0}); if(album.length>6) album=album.slice(-6);
+  S.memoNew=album.length-1;
+  saveAlbum();
+  stageCount++;
+  S.next=suggestStart();
+  SFX.success('p');
+}
+
+// take off: fold the current stage into the costume box
+function startFold(fromMemo){
+  if(S.fold) return;
+  S.fold={t:0,fromMemo}; SFX.fold();
+  girl.garment=null; girl.expr='o';
+  hopTo(girl,'LF',18);
+  S.duet=null; S.bigT=-1; S.box=null; S.flip=null;
+  dress.carry=null;
+  if(dress.node!=='RF') hopTo(dress,'RF',dress.node==='RS'||dress.node==='RE'?16:36);
+  else { dress.q=[]; dress.path=[]; dress.act=null; }
+}
+function updFold(dt){
+  const F=S.fold; if(!F) return;
+  F.t+=dt;
+  if(F.t>=1.1){
+    const keepNext=S.pendingWear;
+    resetStage(false);
+    S.fold=null;
+    girl.expr='smile';
+    // dresser starts somewhere new (always reachable floor)
+    hopTo(dress,'RF',14);
+    const nx=suggestStart();
+    S.next=nx;
+    S.rise={type:nx,t:0}; padAnim[nx].raise=1;
+    if(!keepNext) maybeHat(0.3);
+    if(keepNext){ S.pendingWear=null; wear(keepNext); }
+  }
+}
+function doUndress(){
+  if(!girl.garment && !S.order.length) return false;
+  undressCount++; lureUndress=false;
+  if(S.big && !S.memo) forceMemo();
+  startFold(false);
+  return true;
+}
+
+// ====================================================================
+//  input
+// ====================================================================
+let drag=null, activeId=null;
+function padRect(type){
+  const i=padAnim[type].cx;
+  const slotW=Lo.pw/3;
+  const cxp=Lo.px+slotW*(i+0.5);
+  const cyp=Lo.py+Lo.ph*0.5;
+  return {x:cxp-Lo.bw/2,y:cyp-Lo.bh/2,w:Lo.bw,h:Lo.bh,cx:cxp,cy:cyp};
+}
+function toScreen(x,y){ return [Lo.lx+x*Lo.k, Lo.ly+y*Lo.k]; }
+function girlScreen(){ return toScreen(girl.x,girl.y-26); }
+function hitPad(x,y){
+  for(const t of TYPES){
+    const r=padRect(t); const pad=Math.max(8,Lo.bw*0.06);
+    if(x>=r.x-pad&&x<=r.x+r.w+pad&&y>=r.y-pad&&y<=r.y+r.h+pad) return t;
+  }
+  return null;
+}
+function hitGirl(x,y){
+  const [gx,gy]=girlScreen(); const k=Lo.k;
+  const rw=Math.max(32,18*k), rh=Math.max(40,30*k);
+  return Math.abs(x-gx)<rw && Math.abs(y-gy)<rh;
+}
+function onDown(e){
+  e.preventDefault();
+  audioInit();
+  if(activeId!==null) return; // ignore extra fingers
+  activeId=e.pointerId;
+  try{cv.setPointerCapture(e.pointerId);}catch(_){}
+  everInput=true; idleT=0; if(demo){demo=null; demoDone=true;}
+  const x=e.clientX, y=e.clientY;
+  const t=hitPad(x,y);
+  if(t){
+    drag={kind:'wear',type:t,sx:x,sy:y,x,y,t0:performance.now(),moved:0,snap:0};
+    padAnim[t].press=1; SFX.press();
+    girl.lookAt=t;
+    return;
+  }
+  if(girl.garment && !S.fold && hitGirl(x,y)){
+    drag={kind:'undress',type:girl.garment,sx:x,sy:y,x,y,t0:performance.now(),moved:0,snap:0};
+    SFX.press(); girl.expr='o';
+    return;
+  }
+  // empty area: nothing (no whole-screen reaction)
+  drag=null;
+}
+function onMove(e){
+  if(e.pointerId!==activeId||!drag) return;
+  e.preventDefault();
+  drag.x=e.clientX; drag.y=e.clientY;
+  drag.moved=Math.max(drag.moved,Math.hypot(drag.x-drag.sx,drag.y-drag.sy));
+  idleT=0;
+}
+function onUp(e){
+  if(AC&&AC.state!=='running') audioInit();
+  if(e.pointerId!==activeId) return;
+  e.preventDefault();
+  activeId=null;
+  const d=drag; drag=null;
+  if(!d) return;
+  idleT=0;
+  if(d.kind==='wear'){
+    padAnim[d.type].press=Math.min(padAnim[d.type].press,0.99);
+    const dt=performance.now()-d.t0;
+    const [gx,gy]=girlScreen();
+    const near=Math.hypot(d.x-gx,d.y-gy)<Math.max(90,60*Lo.k);
+    const tap=d.moved<14 && dt<900;
+    if(tap||near||d.snap>0.5){ wear(d.type); }
+    else { padAnim[d.type].wob=1; SFX.cancel(); }
+  }else{
+    const [gx,gy]=girlScreen();
+    const inPad=d.y>Lo.py-10;
+    const [bx,by]=toScreen(20,190);
+    const nearBox=Math.hypot(d.x-bx,d.y-by)<Math.max(60,40*Lo.k);
+    const far=Math.hypot(d.x-gx,d.y-gy)>Math.max(110,70*Lo.k);
+    if(inPad||nearBox||(far&&d.y>gy)) doUndress();
+    else { SFX.cancel(); girl.expr='smile'; }
+  }
+}
+function cancelDrag(){
+  if(drag && drag.kind==='undress') girl.expr='smile';
+  drag=null; activeId=null;
+}
+cv.addEventListener('pointerdown',onDown,{passive:false});
+cv.addEventListener('pointermove',onMove,{passive:false});
+cv.addEventListener('pointerup',onUp,{passive:false});
+cv.addEventListener('pointercancel',e=>{ if(e.pointerId===activeId){ cancelDrag(); } },{passive:false});
+cv.addEventListener('lostpointercapture',e=>{ if(e.pointerId===activeId && drag){ cancelDrag(); } });
+['touchstart','touchmove','touchend','gesturestart','gesturechange','dblclick','contextmenu'].forEach(n=>
+  document.addEventListener(n,e=>{ if(e.cancelable) e.preventDefault(); },{passive:false}));
+window.addEventListener('resize',layout);
+window.addEventListener('orientationchange',()=>setTimeout(layout,120));
+
+// ====================================================================
+//  update
+// ====================================================================
+function update(dt){
+  idleT+=dt;
+  for(const t of TYPES){
+    const a=padAnim[t];
+    const held=drag&&drag.kind==='wear'&&drag.type===t;
+    a.press=held?1:Math.max(0,a.press-dt*5);
+    a.raise=Math.max(0,a.raise-dt*0.9);
+    a.wob=Math.max(0,a.wob-dt*2.5);
+    a.cx=lerp(a.cx,padPos[t],1-Math.pow(0.001,dt));
+  }
+  if(drag&&drag.kind==='wear'){
+    const [gx,gy]=girlScreen();
+    const d=Math.hypot(drag.x-gx,drag.y-gy), R=Math.max(130,90*Lo.k);
+    drag.snap=lerp(drag.snap,d<R?1:0,1-Math.pow(0.0001,dt));
+  }
+  updHems(dt);
+  if(S.stoolLmove){ const m=S.stoolLmove; m.t+=dt/0.5; const u=ease(m.t); S.stoolLp={x:lerp(m.x0,m.x1,u),y:lerp(m.y0,m.y1,u)-Math.sin(u*PI)*30}; if(m.t>=1){S.stoolLp={x:m.x1,y:m.y1};S.stoolLmove=null;SFX.patan();} }
+  if(S.stoolRmove){ const m=S.stoolRmove; m.t+=dt/0.5; const u=ease(m.t); S.stoolRp={x:lerp(m.x0,m.x1,u),y:lerp(m.y0,m.y1,u)-Math.sin(u*PI)*30}; if(m.t>=1){S.stoolRp={x:m.x1,y:m.y1};S.stoolRmove=null;SFX.patan();} }
+  updFlip(dt);
+  updDuet(dt);
+  updBig(dt);
+  updFold(dt);
+  updChar(girl,dt); updChar(dress,dt);
+  if(S.rise){ S.rise.t+=dt; if(S.rise.t>1.6) S.rise=null; }
+  if(S.hat) S.hatT=(S.hatT||0)+dt;
+  if(S.lampFlick>0) S.lampFlick-=dt;
+  for(const s of S.seams) s.t+=dt;
+  if(S.memo) S.memoClock+=dt;
+  for(let i=0;i<12;i++) topLamps[i]=Math.max(0,topLamps[i]-dt*1.5);
+  for(let i=parts.length-1;i>=0;i--){ const p=parts[i]; p.t+=dt; p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy+=160*dt; p.a+=p.va*dt; if(p.t>p.life) parts.splice(i,1); }
+  // snapped LCD positions with afterimages
+  for(const c of [girl,dress]){
+    const sx=Math.round(c.x/5)*5, sy=Math.round(c.y/5)*5;
+    if(sx!==c.sx||sy!==c.sy){ c.after.push({x:c.sx,y:c.sy,t:0}); if(c.after.length>3) c.after.shift(); c.sx=sx; c.sy=sy; }
+    for(let i=c.after.length-1;i>=0;i--){ c.after[i].t+=dt; if(c.after[i].t>0.22) c.after.splice(i,1); }
+  }
+  // lure for undress (gentle, only when nothing else is happening)
+  lureUndress = !S.fold && !S.big && !S.memo && girl.garment && S.order.length>=1 && !S.next && !S.box && idleT>7 && undressCount===0
+             || (!S.fold && !S.big && !S.memo && girl.garment && S.order.length>=1 && idleT>14);
+  // demo hand: once, after 4 s with no input at the very beginning
+  if(!everInput && !demoDone && !demo && idleT>4){ demo={t:0}; }
+  if(demo){ demo.t+=dt; if(demo.t>2.8){ demo=null; demoDone=true; } }
+}
+function currentLure(){
+  if(drag||S.fold||(S.big&&!S.memo)) return null;
+  if(lureUndress) return 'undress';
+  return S.next||null;
+}
+
+// ====================================================================
+//  drawing helpers (segment LCD)
+// ====================================================================
+const STY=[COL.ghost,COL.green,COL.amber];
+let LWID=3.4;
+function sp(style,pts,close,w){
+  cx.lineWidth=(w||LWID);
+  cx.beginPath(); cx.moveTo(pts[0],pts[1]);
+  for(let i=2;i<pts.length;i+=2) cx.lineTo(pts[i],pts[i+1]);
+  if(close) cx.closePath();
+  if(style!==0){
+    cx.save(); cx.translate(1.3,1.6); cx.strokeStyle=COL.shadow; cx.stroke(); cx.restore();
+  }
+  cx.strokeStyle=STY[style]; cx.stroke();
+}
+function ln(style,x1,y1,x2,y2,w){ sp(style,[x1,y1,x2,y2],false,w); }
+function octo(style,x,y,r){
+  const p=[]; for(let i=0;i<8;i++){ const a=i/8*TAU+PI/8; p.push(x+Math.cos(a)*r, y+Math.sin(a)*r); }
+  sp(style,p,true);
+}
+
+// --- garments on the body (local coords, feet at 0) ---
+function garmentShape(type,var1){
+  // returns list of polylines [pts, close]
+  if(type==='b') return [[[-7,-29, 7,-29, 9,-3, -9,-3],true],[[-4,-29, 0,-23, 4,-29],false],[[0,-23,0,-4],false]];
+  if(type==='s'){ const f=var1||0; return [[[-6,-19, 6,-19],false],[[-6,-19,-11-f,-6, -8-f*0.7,-8, -5-f*0.3,-6, -2,-8, 1,-6, 4+f*0.3,-8, 7+f*0.7,-6, 11+f,-6, 6,-19],false]]; }
+  return [[[-7,-19, 7,-19, 9,0, 2,0, 0,-10, -2,0, -9,0],true]];
+}
+function drawGirl(x,y,c,alpha){
+  const g=girl.garment;
+  cx.save(); cx.translate(x,y);
+  if(alpha<1) cx.globalAlpha=alpha;
+  cx.scale(1.15,1.15);
+  const a=c.act?c.act.name:null, at=c.act?c.act.t:0;
+  let yo=0;
+  if(a==='jump'){ yo=-Math.sin(clamp(at/0.45,0,1)*PI)*12; }
+  if(a==='bob') yo=-Math.abs(Math.sin(at*PI/0.8))*2;
+  cx.translate(0,yo);
+  const walking=c.leg&&!c.leg.jump;
+  const stride=walking?Math.sin(c.walkPh)*(g==='b'?9:5):0;
+  const spin=a==='spin'?at:0;
+  const spinF=a==='spin'?Math.sin(at*TAU*1.6):0;
+  // legs
+  if(g!=='p'){
+    if(a==='jump'||(c.leg&&c.leg.jump)){ ln(1,-2,-16,-3,0); ln(1,2,-16,3,0); }
+    else { ln(1,-3,-16,-3-stride,0); ln(1,3,-16,3+stride,0); }
+  }
+  // base clothes (tunic)
+  if(!g) sp(1,[-6,-28,6,-28,8,-15,-8,-15],true);
+  else ln(1,-5,-28,5,-28);
+  // arms
+  let la=[-10,-16], ra=[10,-16];
+  if(a==='reach'){ const r=Math.min(1,at/0.3); const lx=clamp(196-x,-14,14); if(lx<0){ ra=[9,-22]; la=[lerp(-10,lx,r),lerp(-16,-58,r)]; } else { la=[-9,-22]; ra=[lerp(10,Math.max(5,lx),r),lerp(-16,-58,r)]; } }
+  else if(a==='spin'){ la=[-13,-26+spinF*5]; ra=[13,-26-spinF*5]; }
+  else if(a==='jump'){ la=[-11,-38]; ra=[11,-38]; }
+  else if(a==='pose'){ const P=POSES[c.pose%POSES.length]; la=P[0]; ra=P[1]; }
+  else if(walking){ la=[-9-stride*0.4,-17]; ra=[9-stride*0.4,-17]; }
+  else if(drag&&drag.kind==='wear'){ const s=drag.snap; ra=[lerp(10,14,s),lerp(-16,-26,s)]; la=[lerp(-10,-14,s),lerp(-16,-26,s)]; }
+  ln(1,-5,-27,la[0],la[1]); ln(1,5,-27,ra[0],ra[1]);
+  // ghost outlines of the other costumes
+  for(const t of TYPES){ if(t===g) continue; for(const [p,cl] of garmentShape(t,0)) sp(0,p,cl); }
+  // preview while finger presses a costume
+  if(drag&&drag.kind==='wear'&&drag.type!==g){
+    if(Math.floor(now*12)%2===0||drag.snap>0.5) for(const [p,cl] of garmentShape(drag.type,0)) sp(2,p,cl);
+  }
+  // worn garment
+  if(g && !(drag&&drag.kind==='undress')){
+    const flap=lureUndress?Math.sin(now*9)*2:0;
+    const shapes=garmentShape(g,a==='spin'?4+Math.abs(spinF)*3:(walking?1:0));
+    for(const [p,cl] of shapes){
+      if(flap){ const q=p.slice(); for(let i=1;i<q.length;i+=2) if(q[i]>-8) q[i-1]+=flap; sp(2,q,cl); } else sp(2,p,cl);
+    }
+    if(g==='p'){ // legs below pants are short
+      if(a==='jump'){ ln(1,-5,0,-5,2); ln(1,5,0,5,2); }
+    }
+  }else if(g==='p'||(drag&&drag.kind==='undress')){
+    ln(1,-3,-16,-3,0); ln(1,3,-16,3,0);
+  }
+  // head - face always visible
+  octo(1,0,-38,8.2);
+  // hair: bangs + pigtails (never cut)
+  ln(1,-6,-44.5,6,-44.5,2.6);
+  ln(1,-8.5,-41,-13,-35,3); ln(1,8.5,-41,13,-35,3);
+  // eyes look toward lure
+  const ex=clamp(c.lookX,-2,2), ey=clamp(c.lookY,-1.5,1.5);
+  ln(1,-3+ex,-40+ey,-3+ex,-37.5+ey,2.4); ln(1,3+ex,-40+ey,3+ex,-37.5+ey,2.4);
+  const ex2=c.expr;
+  if(ex2==='open') sp(1,[-3,-34.5,0,-32,3,-34.5],true,2.2);
+  else if(ex2==='o') sp(1,[0,-35,1.5,-33.5,0,-32,-1.5,-33.5],true,2);
+  else sp(1,[-3,-34.5,0,-33,3,-34.5],false,2.2);
+  // hat (sits above the bangs, face stays visible)
+  if(S.hat){
+    const hy=-46-Math.max(0,1-(S.hatT||0)*3)*30;
+    sp(2,[-15,hy,15,hy],false,3);
+    sp(2,[-8,hy,-7,hy-10,7,hy-10,8,hy],false,3);
+    ln(1,-7,hy-4,7,hy-4,2);
+  }
+  cx.restore();
+}
+const POSES=[
+  [[-12,-40],[12,-40]], [[-13,-26],[11,-42]], [[-11,-42],[13,-26]],
+  [[-14,-30],[14,-30]], [[-6,-44],[6,-44]], [[-12,-18],[12,-42]]
+];
+function drawDresser(x,y,c,alpha){
+  cx.save(); cx.translate(x,y);
+  if(alpha<1) cx.globalAlpha=alpha;
+  cx.scale(1.15,1.15);
+  const a=c.act?c.act.name:null, at=c.act?c.act.t:0;
+  let yo=0;
+  if(a==='jump') yo=-Math.sin(clamp(at/0.45,0,1)*PI)*13;
+  if(a==='stomp') yo=-Math.abs(Math.sin(at/0.45*PI))*5;
+  cx.translate(0,yo);
+  const walking=c.leg&&!c.leg.jump;
+  const st=walking?Math.sin(c.walkPh)*6:0;
+  // legs
+  if(a==='stomp'){ ln(1,-3,-18,-3,0); ln(1,3,-18,6,-6); ln(1,6,-6,9,-6); }
+  else { ln(1,-3,-18,-3-st,0); ln(1,3,-18,3+st,0); }
+  // body
+  sp(1,[-7,-37,7,-37,6,-18,-6,-18],true);
+  // tape measure scarf (costume person)
+  sp(2,[-3,-37,-4,-24],false,2.4); sp(2,[3,-37,4,-27],false,2.4);
+  ln(0,-4,-22,-4,-20,2);
+  // arms
+  let la=[-11,-20], ra=[11,-20];
+  if(a==='wave'){ const w=Math.sin(at*12); ra=[12+w*3,-52]; }
+  else if(a==='reach'){ const r=Math.min(1,at/0.3); const lx=clamp(196-x,-12,14); ra=[lerp(11,Math.max(6,lx),r),lerp(-20,-74,r)]; la=[-11,-24]; }
+  else if(a==='give'){ ra=[c.face*16,-30]; la=[c.face*14,-28]; }
+  else if(a==='jump'){ la=[-12,-48]; ra=[12,-48]; }
+  else if(a==='stomp'){ la=[-12,-30]; ra=[12,-30]; }
+  else if(a==='pose'){ const P=POSES[(c.pose+3)%POSES.length]; la=[P[0][0]*1.1,P[0][1]-10]; ra=[P[1][0]*1.1,P[1][1]-10]; }
+  else if(c.carry){ la=[-8,-50]; ra=[8,-50]; }
+  ln(1,-6,-36,la[0],la[1]); ln(1,6,-36,ra[0],ra[1]);
+  // head
+  octo(1,0,-47,8.2);
+  sp(1,[-8,-50,-5,-55,5,-55,8,-50],false,2.6);
+  const ex=clamp(c.lookX,-2,2), ey=clamp(c.lookY,-1.5,1.5);
+  ln(1,-3+ex,-49+ey,-3+ex,-46.5+ey,2.4); ln(1,3+ex,-49+ey,3+ex,-46.5+ey,2.4);
+  sp(1,[-3,-43.5,0,-42,3,-43.5],false,2.2);
+  if(c.carry) drawGlyph(c.carry,0,-64,0.9,2);
+  cx.restore();
+}
+function drawGlyph(type,x,y,s,style){
+  cx.save(); cx.translate(x,y); cx.scale(s,s);
+  if(type==='b') sp(style,[-6,-9,6,-9,8,9,-8,9],true,2.6);
+  else if(type==='s') sp(style,[-5,-7,5,-7,10,7,5,5,0,7,-5,5,-10,7],true,2.6);
+  else sp(style,[-7,-8,7,-8,9,9,2,9,0,0,-2,9,-9,9],true,2.6);
+  cx.restore();
+}
+
+// --- platforms ---
+function thickLine(style,x1,x2,y,hatch){
+  ln(style,x1,y,x2,y); ln(style,x1,y+5,x2,y+5,2.4);
+  if(hatch) for(let x=x1+6;x<x2-2;x+=hatch) ln(style,x,y+1.5,x,y+4,1.6);
+}
+function drawBridge(style,p,fold){
+  if(p<=0) return;
+  const x1=116, x2=lerp(116,274,p);
+  cx.save();
+  if(fold>0){ cx.translate(lerp(0,20-195,fold),lerp(0,190-200,fold)); cx.translate(195,200); cx.scale(1-fold*0.9,1-fold*0.9); cx.translate(-195,-200); }
+  thickLine(style,x1,x2,FLOOR,12);
+  // straight hem fringe under bridge (spare board)
+  const boxAway=S.box&&S.box.src==='b'&&S.box.phase>=1&&S.box.phase<6;
+  if(p>=1 && !boxAway && style) { ln(style,180,FLOOR+10,212,FLOOR+10,2.6); ln(style,180,FLOOR+7,180,FLOOR+10,1.6); ln(style,212,FLOOR+7,212,FLOOR+10,1.6); }
+  cx.restore();
+}
+function drawStairs(style,p,fold){
+  if(p<=0) return;
+  cx.save();
+  if(fold>0){ cx.translate(lerp(0,20-150,fold),lerp(0,190-160,fold)); cx.translate(150,160); cx.scale(1-fold*0.9,1-fold*0.9); cx.translate(-150,-160); }
+  const steps=[[92,106,180],[106,120,160],[120,134,140]];
+  const n=Math.ceil(p*4);
+  for(let i=0;i<Math.min(3,n);i++){
+    const [a,b,y]=steps[i];
+    thickLine(style,a,b,y,0);
+    ln(style,a,y,a,y+20,2.4); // riser
+    // pleat folds below
+    ln(style,a+2,y+8,b-2,y+14,1.6);
+  }
+  if(n>=4){
+    const x2=lerp(134,236,clamp(p*4-3,0,1));
+    thickLine(style,134,x2,LAND,10);
+    ln(style,134,LAND,134,LAND+20,2.4);
+    // pleated hanging folds (skirt pleats) under landing
+    for(let x=150;x<x2-8;x+=24) sp(style,[x,LAND+5,x+6,LAND+14,x+12,LAND+5],false,1.6);
+    const boxAway=S.box&&S.box.src==='s'&&S.box.phase>=1&&S.box.phase<6;
+    if(p>=1 && !boxAway && style) { ln(style,236,LAND-2,236,LAND+12,2.6); ln(style,232,LAND+12,240,LAND+12,2.2); }
+  }
+  cx.restore();
+}
+function drawStool(style,x,y,p,front){
+  if(p<=0) return;
+  const h=STH*p, w=12;
+  thickLine(style,x-w,x+w,y-h,0);
+  sp(style,[x-w+1,y-h+5,x-w-2,y,x-3,y,x,y-h*0.45,x+3,y,x+w+2,y,x+w-1,y-h+5],false,2.4);
+  if(front && style) ln(style,x-6,y-h+10,x+6,y-h+10,2.2);
+}
+function drawBox(x,y,s,style,open){
+  cx.save(); cx.translate(x,y); cx.scale(s,s);
+  sp(style,[-12,-16,-12,0,12,0,12,-16],false,3);
+  ln(style,-12,-9,12,-9,1.6);
+  const o=open||0;
+  // lid
+  sp(style,[-13,-16-o*2,lerp(13,-9,o),lerp(-16,-30,o)],false,3);
+  cx.restore();
+}
+
+// ====================================================================
+//  draw LCD
+// ====================================================================
+let now=0;
+function drawLCD(){
+  const k=Lo.k;
+  // bezel
+  const bz=Math.max(6,10*k);
+  cx.setTransform(DPR,0,0,DPR,0,0);
+  rrect(Lo.lx-bz,Lo.ly-bz,Lo.lw+bz*2,Lo.lh+bz*2,bz*1.2); cx.fillStyle=COL.bodyLo; cx.fill();
+  rrect(Lo.lx-bz*0.4,Lo.ly-bz*0.4,Lo.lw+bz*0.8,Lo.lh+bz*0.8,bz*0.6); cx.fillStyle=COL.grey; cx.fill();
+  const gr=cx.createLinearGradient(Lo.lx,Lo.ly,Lo.lx,Lo.ly+Lo.lh);
+  gr.addColorStop(0,COL.glass2); gr.addColorStop(1,COL.glass);
+  cx.fillStyle=gr; cx.fillRect(Lo.lx,Lo.ly,Lo.lw,Lo.lh);
+  cx.save(); cx.beginPath(); cx.rect(Lo.lx,Lo.ly,Lo.lw,Lo.lh); cx.clip();
+  cx.setTransform(DPR*k,0,0,DPR*k,DPR*Lo.lx,DPR*Lo.ly);
+  cx.lineJoin='miter'; cx.lineCap='square';
+  LWID=3.4;
+
+  // --- top memory lamps (places the two have visited) ---
+  for(let i=0;i<12;i++){
+    const x=26+i*31, lv=lampLevel(i), pulse=topLamps[i]>0.3;
+    const big=S.memo||S.big? (Math.floor(now*6+i*(1+S.lightPat%3))%3===0):false;
+    const st=(pulse||big)?2:(lv>0?1:0);
+    ln(st,x-4,8,x+4,8,2.6);
+    for(let r=0;r<3;r++){ ln(r<lv||big?st:0,x-5+r*5,12,x-6+r*6,17,1.8); }
+  }
+
+  // --- static stage ---
+  // floors with thickness (parallel lines)
+  thickLine(1,8,120,FLOOR,14); ln(1,120,FLOOR,120,232,2.4);
+  thickLine(1,270,392,FLOOR,14); ln(1,270,FLOOR,270,232,2.4);
+  // gap bottom (soft, unlit)
+  for(let x=126;x<266;x+=14) ln(0,x,236,x+7,236,2);
+  // costume box at left
+  const lid=lureUndress?(0.5+0.5*Math.sin(now*6)):(drag&&drag.kind==='undress'?1:(S.fold?Math.min(1,S.fold.t*3):(S.rise?Math.max(0,1-S.rise.t):0)));
+  drawBox(20,FLOOR,1,(lureUndress||S.fold||S.rise||(drag&&drag.kind==='undress'))?2:1,lid);
+  // rising next costume from box
+  if(S.rise){ const u=ease(S.rise.t/0.6); if(Math.floor(now*8)%2===0||S.rise.t<0.8) drawGlyph(S.rise.type,20,FLOOR-14-u*22,0.9,2); }
+  // lamp (照明)
+  ln(1,196,0,196,32,2);
+  const lampSt=S.lamp?2:(S.lampFlick>0&&Math.floor(now*14)%2?2:1);
+  sp(lampSt,[188,44,191,34,201,34,204,44],true);
+  // rays: ghost always, lit when on
+  const rays=[[186,50,180,58],[193,52,191,62],[180,44,172,46],[180,37,172,33],[205,37,212,31]];
+  for(let i=0;i<rays.length;i++){
+    const r=rays[i];
+    let on=0;
+    if(S.lamp){ on=2; if(S.lamp===2 && Math.floor(now*4+i)%2) on=1; if(S.call===2&&i<3) on=0; }
+    if(S.big||S.memo) on=(Math.floor(now*5+i*(S.lightPat+1))%2)?2:1;
+    ln(on,r[0],r[1],r[2],r[3],2.4);
+  }
+  // partition (仕切り) – flips at the first connection
+  drawPartition();
+  // ghost outlines of all hem slots (unlit segments stay visible)
+  if(!S.has.b||S.prog.b<1) drawBridge(0,1,0);
+  if(!S.has.s||S.prog.s<1) drawStairs(0,1,0);
+  drawStool(0,48,FLOOR,1); drawStool(0,226,LAND,1); drawStool(0,252,FLOOR,1); drawStool(0,S.stoolRx,FLOOR,1);
+
+  // --- built platforms (amber) ---
+  const fk=S.fold?ease(S.fold.t/0.9):0;
+  if(S.has.b) drawBridge(2,S.prog.b,fk);
+  if(S.has.s) drawStairs(2,S.prog.s,fk);
+  if(S.has.p && S.prog.p>0){
+    const p=S.prog.p;
+    cx.save();
+    const lp=S.stoolLp, rp=S.stoolRp;
+    if(fk>0){ cx.globalAlpha=1-fk*0.7; }
+    const lx=lerp(lp.x,20,fk), ly=lerp(lp.y,190,fk), rx=lerp(rp.x,20,fk), ry=lerp(rp.y,190,fk);
+    drawStool(2,lx,ly,p*(1-fk*0.8),false);
+    const boxAway=S.box&&S.box.src==='p'&&S.box.phase>=1&&S.box.phase<6;
+    drawStool(2,rx,ry,p*(1-fk*0.8),!boxAway);
+    cx.restore();
+  }
+  // seams (継ぎ目) where hems connected
+  if(!S.fold) for(const s of S.seams){
+    const on=s.t<1.2?(Math.floor(s.t*10)%2?2:1):1;
+    ln(on,s.x-4,s.y-4,s.x+4,s.y+4,2.2); ln(on,s.x+4,s.y-4,s.x-4,s.y+4,2.2);
+  }
+  // call & response lower lights on the bridge
+  if(S.has.b && S.prog.b>=1 && !S.fold){
+    for(let i=0;i<4;i++){ const x=140+i*36; const on=(S.call===2)||(S.big||S.memo)&&Math.floor(now*5+i)%2?2:(S.call===1?0:0); ln(on,x,FLOOR+14,x+8,FLOOR+14,2.2); }
+  }
+  // hems extending
+  for(const h of S.hems){
+    const u=clamp(h.t/h.dur,0,1);
+    const pp=partialPoly(h.pts,u);
+    const f=[]; for(const q of pp) f.push(q[0],q[1]);
+    if(f.length>=4) sp(2,f,false,2.8);
+    const tip=pp[pp.length-1]; ln(1,tip[0]-3,tip[1],tip[0]+3,tip[1],2.6);
+  }
+  // board->box carrying costume
+  if(S.box) drawTravelBox();
+
+  // --- characters with afterimages ---
+  for(const a of dress.after) drawDresser(a.x,a.y,dress,0.28*(1-a.t/0.22));
+  drawDresser(dress.sx,dress.sy,dress,1);
+  for(const a of girl.after) drawGirl(a.x,a.y,girl,0.28*(1-a.t/0.22));
+  drawGirl(girl.sx,girl.sy,girl,1);
+
+  // shards
+  for(const p of parts){
+    const dx=Math.cos(p.a)*p.len, dy=Math.sin(p.a)*p.len;
+    if(p.t<p.life*0.7||Math.floor(p.t*20)%2) ln(p.col,p.x-dx/2,p.y-dy/2,p.x+dx/2,p.y+dy/2,2.2);
+  }
+
+  // album (always: tiny strip; memorial: big frame)
+  drawAlbum();
+  cx.restore();
+  // glass reflection
+  cx.setTransform(DPR,0,0,DPR,0,0);
+  const rg=cx.createLinearGradient(Lo.lx,Lo.ly,Lo.lx+Lo.lw*0.6,Lo.ly+Lo.lh);
+  rg.addColorStop(0,'rgba(255,255,255,0.05)'); rg.addColorStop(0.35,'rgba(255,255,255,0.0)');
+  cx.fillStyle=rg; cx.fillRect(Lo.lx,Lo.ly,Lo.lw,Lo.lh);
+}
+function drawPartition(){
+  const x=380, w=12, y1=128, y2=FLOOR;
+  let sc=1, back=S.flipped;
+  if(S.flip){ const u=S.flip.t/0.7; sc=Math.cos(u*PI); back=u>0.5; }
+  const hw=w*Math.abs(sc);
+  cx.save();
+  const lit=back?2:1;
+  sp(lit,[x-hw,y1,x+hw,y1,x+hw,y2,x-hw,y2],true,2.8);
+  if(hw>3){
+    if(!back){ for(let yy=y1+10;yy<y2-4;yy+=12) ln(1,x-hw+3,yy,x+hw-3,yy,1.6); }
+    else{
+      // back side: stage-light pattern (diamonds)
+      for(let yy=y1+12;yy<y2-6;yy+=18){
+        const on=(S.big||S.memo)?(Math.floor(now*6+yy)%2?2:1):2;
+        sp(on,[x,yy-6,x+hw*0.6,yy,x,yy+6,x-hw*0.6,yy],true,1.8);
+      }
+    }
+  }
+  cx.restore();
+}
+function drawTravelBox(){
+  const B=S.box;
+  if(B.phase===0){ // plank glows before lifting
+    if(Math.floor(now*10)%2) ln(2,B.x0-12,B.y0,B.x0+12,B.y0,3);
+    return;
+  }
+  let f=1;
+  if(B.phase===1) f=ease(B.t/0.5);
+  if(B.phase===5) f=1-ease(B.t/0.4);
+  // plank (f=0) -> box (f=1)
+  cx.save(); cx.translate(B.x,B.y);
+  const hgt=14*f;
+  sp(2,[-12,-hgt,-12,0,12,0,12,-hgt],false,3);
+  if(f>0.5) ln(2,-12,-hgt*0.5,12,-hgt*0.5,1.6);
+  if(B.phase>=1&&B.phase<=2){ drawGlyph(B.type,0,-hgt-4,0.7,Math.floor(now*8)%2?2:1); }
+  if(B.phase===3){ const u=ease(B.t/0.45); drawGlyph(B.type,0,-hgt-4-u*16,0.9,2); }
+  cx.restore();
+}
+function drawAlbum(){
+  const n=album.length;
+  if(!S.memo){
+    // tiny dots: how many stages are in the album
+    for(let i=0;i<6;i++) ln(i<n?1:0,330+i*10,24,334+i*10,24,2.2);
+    return;
+  }
+  // memorial frame: corner brackets blink like an LCD album page
+  const t=S.memoClock;
+  const on=Math.floor(t*3)%2?2:1;
+  sp(on,[6,30,6,6,30,6],false,3.4); sp(on,[370,6,394,6,394,30],false,3.4);
+  sp(on,[6,230,6,254,30,254],false,3.4); sp(on,[370,254,394,254,394,230],false,3.4);
+  // album strip
+  for(let i=0;i<6;i++){
+    const x=i<3?28+i*52:236+(i-3)*52, y=30;
+    sp(0,[x,y,x+44,y,x+44,y+30,x,y+30],true,2);
+    const e=album[i]; if(!e) continue;
+    const blink=(i===S.memoNew && Math.floor(t*5)%2===0);
+    const st=blink?0:(i===S.memoNew?2:1);
+    sp(st,[x,y,x+44,y,x+44,y+30,x,y+30],true,2);
+    for(let j=0;j<3;j++){
+      const ox=x+8+j*14, oy=y+20, c=e.o[j];
+      if(c==='b') ln(st,ox-5,oy,ox+5,oy,2);
+      else if(c==='s') sp(st,[ox-5,oy,ox-5,oy-4,ox,oy-4,ox,oy-8,ox+5,oy-8],false,2);
+      else sp(st,[ox-4,oy,ox-4,oy-6,ox+4,oy-6,ox+4,oy],false,2);
+    }
+    if(e.h) sp(st,[x+34,y+8,x+40,y+8,x+38,y+4,x+36,y+4],true,1.6);
+  }
+}
+
+// ====================================================================
+//  draw pad (physical light-colored costume buttons)
+// ====================================================================
+function rrect(x,y,w,h,r){
+  r=Math.min(r,w/2,h/2);
+  cx.beginPath(); cx.moveTo(x+r,y); cx.arcTo(x+w,y,x+w,y+h,r); cx.arcTo(x+w,y+h,x,y+h,r); cx.arcTo(x,y+h,x,y,r); cx.arcTo(x,y,x+w,y,r); cx.closePath();
+}
+function padShapePath(type,w,h,press,ext){
+  // centered at 0,0 ; returns via cx path
+  const u=w/2, v=h/2;
+  cx.beginPath();
+  if(type==='b'){
+    const hem=0.46+ext*0.1;
+    const P=[[-0.18,-0.46],[0.18,-0.46],[0.46,-0.30],[0.5,0.12],[0.34,0.14],[0.31,-0.08],[0.33,hem],[-0.33,hem],[-0.31,-0.08],[-0.34,0.14],[-0.5,0.12],[-0.46,-0.30]];
+    P.forEach((p,i)=>{ const X=p[0]*w, Y=p[1]*h; i?cx.lineTo(X,Y):cx.moveTo(X,Y); });
+  }else if(type==='s'){
+    const sp2=ext*0.08;
+    cx.moveTo(-0.28*w,-0.38*h); cx.lineTo(0.28*w,-0.38*h);
+    cx.lineTo((0.5+sp2)*w,0.36*h);
+    const n=6; for(let i=0;i<=n;i++){ const X=lerp(0.5+sp2,-0.5-sp2,i/n)*w; const Y=(i%2?0.28:0.38)*h; cx.lineTo(X,Y); }
+    cx.closePath();
+  }else{
+    const cf=ext*0.06;
+    const P=[[-0.36,-0.42],[0.36,-0.42],[0.44+cf,0.46],[0.08-cf*0.5,0.46],[0,0.0],[-0.08+cf*0.5,0.46],[-0.44-cf,0.46]];
+    P.forEach((p,i)=>{ const X=p[0]*w, Y=p[1]*h; i?cx.lineTo(X,Y):cx.moveTo(X,Y); });
+    cx.closePath();
+  }
+}
+function drawPadItem(type,x,y,w,h,opts){
+  const fill={b:COL.padLime,s:COL.padAmber,p:COL.padPale}[type];
+  const press=opts.press||0, ext=opts.ext||0;
+  cx.save(); cx.translate(x,y);
+  cx.scale(1+press*0.07,1-press*0.1);
+  if(opts.rot) cx.rotate(opts.rot);
+  // shadow
+  if(!opts.flat){ cx.save(); cx.translate(0,(1-press)*h*0.05+2); padShapePath(type,w,h,press,ext); cx.fillStyle='rgba(0,0,0,0.45)'; cx.fill(); cx.restore(); }
+  padShapePath(type,w,h,press,ext);
+  cx.fillStyle=fill; cx.fill();
+  cx.lineWidth=Math.max(2,w*0.035); cx.strokeStyle=opts.glow?COL.amber:COL.ink; cx.lineJoin='round'; cx.stroke();
+  // details
+  cx.lineWidth=Math.max(1.5,w*0.022); cx.strokeStyle='rgba(27,33,27,0.55)';
+  cx.beginPath();
+  if(type==='b'){ cx.moveTo(-0.1*w,-0.46*h); cx.lineTo(0,-0.28*h); cx.lineTo(0.1*w,-0.46*h); cx.moveTo(0,-0.28*h); cx.lineTo(0,(0.44+ext*0.1)*h);
+    cx.stroke(); cx.fillStyle='rgba(27,33,27,0.55)'; for(let i=0;i<3;i++){ cx.fillRect(0.05*w,(-0.16+i*0.18)*h,w*0.05,w*0.05);} }
+  else if(type==='s'){ for(let i=1;i<6;i++){ const X0=lerp(-0.26,0.26,i/6)*w, X1=lerp(-0.5-ext*0.08,0.5+ext*0.08,i/6)*w; cx.moveTo(X0,-0.36*h); cx.lineTo(X1,0.3*h);} cx.moveTo(-0.28*w,-0.28*h); cx.lineTo(0.28*w,-0.28*h); cx.stroke(); }
+  else { cx.moveTo(-0.36*w,-0.3*h); cx.lineTo(0.36*w,-0.3*h); cx.moveTo(0,-0.42*h); cx.lineTo(0,-0.1*h); cx.stroke(); }
+  cx.restore();
+}
+function drawPad(){
+  cx.setTransform(DPR,0,0,DPR,0,0);
+  // housing tray
+  rrect(Lo.px,Lo.py,Lo.pw,Lo.ph,Math.min(28,Lo.ph*0.12)); cx.fillStyle=COL.bodyHi; cx.fill();
+  rrect(Lo.px+4,Lo.py+4,Lo.pw-8,Lo.ph-8,Math.min(24,Lo.ph*0.1)); cx.fillStyle=COL.bodyLo; cx.fill();
+  const lure=currentLure();
+  for(const t of TYPES){
+    const r=padRect(t), a=padAnim[t];
+    // socket
+    rrect(r.cx-r.w*0.56,r.cy-r.h*0.54,r.w*1.12,r.h*1.08,r.w*0.16); cx.fillStyle='#202520'; cx.fill();
+    const isLure=lure===t;
+    const dragging=drag&&drag.kind==='wear'&&drag.type===t&&drag.moved>14;
+    const targetUndress=drag&&drag.kind==='undress'&&drag.type===t;
+    let yo=0, rot=0;
+    if(isLure){ yo=-Math.abs(Math.sin(now*4.2))*r.h*0.07; rot=Math.sin(now*4.2)*0.05; }
+    else rot=Math.sin(now*1.3+r.cx)*0.008;
+    if(a.raise>0){ yo-=Math.sin(Math.min(1,(1-a.raise)*3)*PI)*r.h*0.18; }
+    if(a.wob>0) rot+=Math.sin(a.wob*20)*0.12*a.wob;
+    if(isLure && !dragging){
+      cx.save(); cx.globalAlpha=0.35+0.25*Math.sin(now*6);
+      rrect(r.cx-r.w*0.58,r.cy-r.h*0.56,r.w*1.16,r.h*1.12,r.w*0.18); cx.lineWidth=Math.max(3,r.w*0.05); cx.strokeStyle=COL.amber; cx.stroke(); cx.restore();
+    }
+    if(targetUndress){
+      cx.save(); cx.globalAlpha=0.5+0.3*Math.sin(now*10);
+      rrect(r.cx-r.w*0.58,r.cy-r.h*0.56,r.w*1.16,r.h*1.12,r.w*0.18); cx.lineWidth=Math.max(3,r.w*0.05); cx.strokeStyle=COL.green; cx.stroke(); cx.restore();
+    }
+    const worn=girl.garment===t;
+    const scaleW=r.w*0.9, scaleH=r.h*0.82;
+    if(dragging){
+      // empty socket outline
+      cx.save(); cx.translate(r.cx,r.cy); padShapePath(t,scaleW,scaleH,0,0); cx.setLineDash([6,6]); cx.lineWidth=2; cx.strokeStyle='rgba(215,236,130,0.4)'; cx.stroke(); cx.restore();
+    }else{
+      cx.save(); if(worn&&!a.press&&!isLure) cx.globalAlpha=0.55;
+      drawPadItem(t,r.cx,r.cy+yo+a.press*r.h*0.04,scaleW,scaleH,{press:a.press,ext:a.press,rot,glow:isLure});
+      cx.restore();
+    }
+  }
+  // dragged costume follows the finger (with magnet near the girl)
+  if(drag&&drag.kind==='wear'&&drag.moved>14){
+    const [gx,gy]=girlScreen();
+    const s=drag.snap;
+    const x=lerp(drag.x,gx,s*0.6), y=lerp(drag.y-Lo.bh*0.25,gy,s*0.6);
+    const sz=lerp(Lo.bw*0.7,Math.max(36,28*Lo.k),s);
+    drawPadItem(drag.type,x,y,sz,sz*1.2,{press:0,ext:0.5+0.5*Math.sin(now*12),rot:Math.sin(now*8)*0.06});
+  }
+  if(drag&&drag.kind==='undress'){
+    const sz=Math.max(44,Lo.bw*0.55);
+    drawPadItem(drag.type,drag.x,drag.y-sz*0.3,sz,sz*1.2,{press:0,ext:0,rot:Math.sin(now*8)*0.08});
+  }
+}
+function drawHand(){
+  if(!demo) return;
+  cx.setTransform(DPR,0,0,DPR,0,0);
+  const r=padRect('b'); const [gx,gy]=girlScreen();
+  const t=demo.t;
+  let u=0, alpha=1, x, y;
+  if(t<0.5){ u=0; alpha=t/0.5; } else if(t<2.2){ u=ease((t-0.6)/1.5); } else { u=1; alpha=1-(t-2.2)/0.6; }
+  x=lerp(r.cx,gx,u); y=lerp(r.cy,gy+20,u);
+  cx.save(); cx.globalAlpha=clamp(alpha,0,1);
+  if(u>0.02&&u<0.98) drawPadItem('b',x,y-Lo.bh*0.2,Lo.bw*0.5,Lo.bw*0.6,{flat:true});
+  const s=Math.max(26,Lo.bw*0.28);
+  cx.translate(x+s*0.2,y+s*0.3);
+  cx.fillStyle='#f4ead2'; cx.strokeStyle=COL.ink; cx.lineWidth=3;
+  rrect(-s*0.35,0,s*0.7,s*0.8,s*0.25); cx.fill(); cx.stroke();
+  rrect(-s*0.12,-s*0.6,s*0.24,s*0.8,s*0.12); cx.fill(); cx.stroke();
+  cx.restore();
+}
+function drawBody(){
+  cx.setTransform(DPR,0,0,DPR,0,0);
+  cx.fillStyle=COL.body; cx.fillRect(0,0,W,H);
+  // subtle speaker grille marks on housing (no text)
+  cx.fillStyle=COL.bodyLo;
+  const gy=Lo.ly+Lo.lh+Math.max(6,10*Lo.k)+4;
+  for(let i=0;i<5;i++) cx.fillRect(Lo.lx+Lo.lw-60+i*10,gy,5,3);
+}
+
+// ====================================================================
+//  look targets
+// ====================================================================
+function updLooks(){
+  const l=currentLure();
+  let tx,ty;
+  if(drag&&drag.kind==='wear'){ tx=drag.x; ty=drag.y; }
+  else if(l==='undress'){ const p=toScreen(20,180); tx=p[0]; ty=p[1]; }
+  else if(l){ const r=padRect(l); tx=r.cx; ty=r.cy; }
+  else if(S.duet||S.big){ const p=toScreen(dress.x,dress.y-40); tx=p[0]; ty=p[1]; }
+  else { const p=toScreen(S.lamp?196:dress.x,S.lamp?40:dress.y-40); tx=p[0]; ty=p[1]; }
+  for(const c of [girl,dress]){
+    let ax=tx,ay=ty;
+    if(c===dress&&(S.duet||S.big)){ const p=toScreen(girl.x,girl.y-30); ax=p[0]; ay=p[1]; }
+    const p=toScreen(c.x,c.y-40);
+    const dx=ax-p[0], dy=ay-p[1], d=Math.hypot(dx,dy)||1;
+    c.lookX=lerp(c.lookX,dx/d*2,0.15); c.lookY=lerp(c.lookY,dy/d*1.5,0.15);
+  }
+  dress.pose=(S.order.length?['bsp','bps','sbp','spb','pbs','psb'].indexOf(S.order.join('')):0);
+  if(dress.pose<0) dress.pose=0;
+  girl.pose=dress.pose;
+}
+
+// ====================================================================
+//  loop
+// ====================================================================
+let last=0, rafId=0, running=false;
+function frame(ts){
+  rafId=0;
+  if(!running) return;
+  const t=ts/1000;
+  let dt=last?t-last:0.016; last=t;
+  dt=clamp(dt,0,0.05);
+  now+=dt;
+  update(dt);
+  updLooks();
+  drawBody(); drawLCD(); drawPad(); drawHand();
+  rafId=requestAnimationFrame(frame);
+}
+function start(){ if(running) return; running=true; last=0; rafId=requestAnimationFrame(frame); }
+function stop(){ running=false; if(rafId) cancelAnimationFrame(rafId); rafId=0; }
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden){ stop(); cancelDrag(); try{ if(AC&&AC.state==='running') AC.suspend(); }catch(e){} }
+  else { last=0; start(); try{ if(AC&&audioWanted) AC.resume().catch(()=>{}); }catch(e){} }
+});
+window.addEventListener('pagehide',()=>{ stop(); });
+window.addEventListener('pageshow',()=>{ if(!document.hidden) start(); });
+
+layout();
+for(const t of TYPES) padAnim[t].cx=padPos[t];
+start();
+
+// test hooks (automation only; no UI)
+window.__gf={S,girl,dress,album:()=>album,padRect,girlScreen,toScreen,wear,undress:doUndress,
+  lure:currentLure,demo:()=>demo, parts:()=>parts.length,
+  state:()=>({order:S.order.slice(),has:Object.assign({},S.has),lamp:S.lamp,flipped:S.flipped,big:S.big,memo:S.memo,
+    girl:{node:girl.node,garment:girl.garment,act:girl.act&&girl.act.name},dress:{node:dress.node,act:dress.act&&dress.act.name,carry:dress.carry},
+    stoolL:S.stoolL,stoolR:S.stoolR,next:S.next,hat:S.hat,fold:!!S.fold,box:S.box&&S.box.phase,duet:S.duet&&S.duet.kind,padOrder:padOrder.slice(),home:S.home,seams:S.seams.length})};
+})();
+</script>
+</body>
+</html>
