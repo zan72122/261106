@@ -1,0 +1,1174 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="format-detection" content="telephone=no">
+<meta name="robots" content="noindex,nofollow">
+<title>びよーん、ぱたん！ひとまい屋根のリレー楽団</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#ffffff;
+  touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+  -webkit-tap-highlight-color:transparent;overscroll-behavior:none;position:fixed;inset:0}
+canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block;touch-action:none;outline:none}
+#sa{position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
+  padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);
+  padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+(function(){
+'use strict';
+// =====================================================================
+//  びよーん、ぱたん！ひとまい屋根のリレー楽団
+//  一枚布の取っ手を一本指で引き、三人へリレーして屋根を張る。
+//  受け手が引き手になり、前の引き手は拍手係へ。三人目で屋根が完成し、
+//  同じ取っ手が「反動演奏台」に変わる。弾いた音型を三人がまねて一曲を締め、
+//  布を畳んで別の順番で再開する。
+//  色は 赤・青・黄・黒・白 の平らな面のみ（グラデーション・半透明なし）。
+// =====================================================================
+
+const COL = { W:'#ffffff', R:'#e3241b', B:'#1f4ed6', Y:'#ffd200', K:'#111111' };
+const CLOTH = [COL.R, COL.Y, COL.B];
+const BPM = 108, STEP = 60 / BPM / 2;            // 8分音符
+const MAX_PARTICLES = 70, MAX_RINGS = 26, MAX_VOICES = 44;
+const STAGE_HITS = 6;
+
+const cv = document.getElementById('c');
+const g = cv.getContext('2d');
+const saEl = document.getElementById('sa');
+
+let W = 0, H = 0, DPR = 1, X0 = 0, Y0 = 0, UW = 0, UH = 0;
+let kh = 100, handH = 114, cw = 42, shR = 72, grabR = 50;
+const Lp = {};
+
+const nowP = () => performance.now() / 1000;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+function distSeg(px, py, ax, ay, bx, by){
+  const dx = bx - ax, dy = by - ay, l2 = dx*dx + dy*dy;
+  let t = l2 > 0 ? ((px-ax)*dx + (py-ay)*dy) / l2 : 0; t = clamp(t, 0, 1);
+  return Math.hypot(px - (ax + dx*t), py - (ay + dy*t));
+}
+function inPoly(px, py, pts){
+  let ins = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++){
+    const a = pts[i], b = pts[j];
+    if (((a.y > py) !== (b.y > py)) && (px < (b.x - a.x) * (py - a.y) / (b.y - a.y) + a.x)) ins = !ins;
+  }
+  return ins;
+}
+const ease = t => t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2) / 2;
+
+// ---------------------------------------------------------------- 人物
+// 0: 左（赤）  1: 手前中央（白黒しま）  2: 右（黄）
+const KEYS = [110, 146.83, 196];                 // 最初の受け手で曲の調が決まる
+const PENTA = [0, 2, 4, 7, 9, 12];
+const BASS = [
+  [[0,0],[6,7],[8,0],[14,4]],                    // 左から: 低くどっしり
+  [[0,0],[4,7],[10,9],[12,0]],                   // 手前から: はずむ
+  [[0,12],[3,7],[6,12],[10,9],[13,7]]            // 右から: 高く跳ねる
+];
+const kids = [
+  { id:0, shirt:COL.R, ring:COL.R, home:'h0', sf:52,  heavyDef:true,  defStomp:[0,4,8,12] },
+  { id:1, shirt:'stripe', ring:COL.K, home:'h1', sf:84,  heavyDef:false, defStomp:[0,6,8,14] },
+  { id:2, shirt:COL.Y, ring:COL.Y, home:'h2', sf:128, heavyDef:false, defStomp:[2,5,10,13] }
+];
+for (const k of kids){
+  Object.assign(k, { spot:k.home, pos:{x:0,y:0}, role:'wait', lean:0, jump:0, cheer:0, squash:0,
+    lift:0, liftLeg:0, clapT:0, kneeT:0, wob:0, stomps:[], clapSteps:[], sitting:false, reach:0, seed:Math.random()*6 });
+}
+const benches = [ { id:'b0', bounce:0, wob:0, shaded:false }, { id:'b1', bounce:0, wob:0, shaded:false } ];
+
+// ---------------------------------------------------------------- 状態
+let phase = 'relay';            // relay | toStage | stage | finale | fold
+let corners = [{kind:'pole'}];
+let holder = -1;
+let order = [];
+let cycle = 0;
+let opening = -1, keyRoot = 0, musicOn = false;
+let stageHits = 0, stageRec = [], finalePending = false, finale = null;
+let fold = null, toStage = null, toStageAt = 0;
+let lastUnison = -99;
+let poleWob = 0, flash = 0;
+const memory = { orders:[], lastRebound:[], prevFinal:-1 };
+const roofVib = { x:0, y:0, vx:0, vy:0 };
+let stripVib = 0;
+const handle = { x:0, y:0, fx:0, fy:0, drag:false, squash:0, hop:0, bounce:null, hover:null, pressT:0 };
+let activePid = null;
+let lastInput = nowP();
+const demo = { active:false, t0:0, shownRelay:false, shownStage:false, x:0, y:0, ox:0, oy:0, press:0 };
+let firstTouchDone = false;
+const rings = [], parts = [];
+const vq = [];                  // 予約した見た目の反応
+const pend = [];                // 拍に吸着させる予約
+let gs = 0, nextStepTime = nowP() + 0.1;
+
+// ---------------------------------------------------------------- 配置
+function layout(){
+  W = window.innerWidth; H = window.innerHeight;
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  const cs = getComputedStyle(saEl);
+  const st = parseFloat(cs.paddingTop) || 0, sr = parseFloat(cs.paddingRight) || 0;
+  const sb = parseFloat(cs.paddingBottom) || 0, sl = parseFloat(cs.paddingLeft) || 0;
+  X0 = sl; Y0 = st; UW = Math.max(100, W - sl - sr); UH = Math.max(100, H - st - sb);
+  const portrait = UH > UW * 1.15;
+  kh = portrait ? Math.min(UW * 0.27, UH * 0.15) : Math.min(UW * 0.19, UH * 0.2);
+  handH = kh * 1.3; cw = kh * 0.42; shR = kh * 0.72; grabR = Math.max(44, kh * 0.5);
+  const P = portrait ? { pt:.12, pb:.40, ky:.63, kx:.27, cy:.85 } : { pt:.07, pb:.42, ky:.69, kx:.28, cy:.92 };
+  Lp.poleTop  = { x:X0 + UW*.5, y:Y0 + UH*P.pt };
+  Lp.poleBase = { x:X0 + UW*.5, y:Y0 + UH*P.pb };
+  Lp.hook     = { x:Lp.poleTop.x + kh*0.06, y:Lp.poleTop.y + kh*0.66 };
+  Lp.h0 = { x:X0 + UW*P.kx,     y:Y0 + UH*P.ky };
+  Lp.h2 = { x:X0 + UW*(1-P.kx), y:Y0 + UH*P.ky };
+  Lp.h1 = { x:X0 + UW*.5,       y:Y0 + UH*P.cy };
+  Lp.b0 = { x:Math.max(X0 + kh*0.38, Lp.h0.x - kh*0.66), y:Lp.h0.y - kh*0.1 };
+  Lp.b1 = { x:Math.min(X0 + UW - kh*0.38, Lp.h2.x + kh*0.66), y:Lp.h2.y - kh*0.1 };
+  Lp.horizon = Lp.poleBase.y - kh*0.22;
+  for (const k of kids){ const f = spotFeet(k.spot); k.pos.x = f.x; k.pos.y = f.y; }
+}
+
+function spotSit(id){ return id === 'b0' || id === 'b1'; }
+function stageFeet(){
+  let sx = 0, sy = 0, n = 0;
+  for (const c of corners){ if (c.kind === 'kid') continue; const f = rawFloor(c); sx += f.x; sy += f.y; n++; }
+  if (!n) return { x:Lp.h1.x, y:Lp.h1.y };
+  return { x:clamp(sx/n, X0 + kh*0.6, X0 + UW - kh*0.6), y:clamp(sy/n - kh*0.12, Lp.poleBase.y + kh*0.55, Y0 + UH - kh*0.12) };
+}
+function spotFeet(id){
+  if (id === 'st') return stageFeet();
+  return Lp[id] || Lp.h1;
+}
+function spotHand(id){ const f = spotFeet(id); return { x:f.x, y:f.y - handH * (spotSit(id) ? 0.98 : 1) }; }
+function kidJumpY(k){ return k.jump > 0 ? Math.sin(Math.PI * (1 - k.jump)) * kh * 0.26 : 0; }
+function kidHand(k){
+  return { x:k.pos.x + Math.sin(k.lean) * kh * 0.3, y:k.pos.y - handH * (k.sitting ? 0.98 : 1) - kidJumpY(k) };
+}
+function rawAir(c){
+  if (c.kind === 'pole') return Lp.poleTop;
+  if (c.kind === 'kid') return kidHand(kids[c.k]);
+  return spotHand(c.spot);
+}
+function rawFloor(c){
+  if (c.kind === 'pole') return Lp.poleBase;
+  if (c.kind === 'kid') return kids[c.k].pos;
+  return spotFeet(c.spot);
+}
+function cornerAir(c, i){
+  const p = rawAir(c);
+  if (fold){ const e = ease(clamp(fold.p, 0, 1)); return { x:lerp(p.x, Lp.poleTop.x, e), y:lerp(p.y, Lp.poleTop.y, e) }; }
+  return p;
+}
+function cornerFloor(c){
+  const p = rawFloor(c);
+  if (fold){ const e = ease(clamp(fold.p, 0, 1)); return { x:lerp(p.x, Lp.poleBase.x, e), y:lerp(p.y, Lp.poleBase.y, e) }; }
+  return p;
+}
+function airCentroid(){
+  let sx = 0, sy = 0; for (let i = 0; i < corners.length; i++){ const p = cornerAir(corners[i], i); sx += p.x; sy += p.y; }
+  return { x:sx / corners.length, y:sy / corners.length };
+}
+function stageCenterRest(){ const f = stageFeet(); return { x:f.x, y:f.y - handH - kh*0.44 }; }
+function fanCenter(){
+  const ac = airCentroid();
+  let c = ac;
+  if (phase === 'toStage' && toStage){ const s = stageCenterRest(); const e = ease(clamp(toStage.p, 0, 1)); c = { x:lerp(ac.x, s.x, e), y:lerp(ac.y, s.y, e) }; }
+  else if (phase === 'stage' || phase === 'finale'){ c = stageCenterRest(); }
+  else if (phase === 'fold' && fold && fold.from){ const e = ease(clamp(fold.p,0,1)); c = { x:lerp(fold.from.x, Lp.poleTop.x, e), y:lerp(fold.from.y, Lp.poleTop.y, e) }; }
+  let px = 0, py = 0;
+  if (phase === 'stage' || phase === 'finale'){
+    const r = handleRest(); px = (handle.x - r.x) * 0.5; py = (handle.y - r.y) * 0.5;
+  }
+  return { x:c.x + roofVib.x + px, y:c.y + roofVib.y + py };
+}
+function handleRest(){
+  if (phase === 'stage' || phase === 'finale' || phase === 'toStage'){
+    const k = kids[holder]; if (k){ const h = kidHand(k); return { x:h.x, y:h.y - kh * 0.1 }; }
+  }
+  if (phase === 'fold'){ return fold && fold.hfrom ? { x:lerp(fold.hfrom.x, Lp.hook.x, ease(clamp(fold.p,0,1))), y:lerp(fold.hfrom.y, Lp.hook.y, ease(clamp(fold.p,0,1))) } : Lp.hook; }
+  if (holder >= 0){ const h = kidHand(kids[holder]); return { x:h.x, y:h.y - kh * 0.1 }; }
+  return Lp.hook;
+}
+function stripStart(){
+  if (phase === 'stage' || phase === 'finale' || phase === 'toStage') return fanCenter();
+  return cornerAir(corners[corners.length - 1], corners.length - 1);
+}
+function canGrab(){
+  if (phase === 'relay') return order.length < 3 && !toStageAt;
+  if (phase === 'stage') return !finalePending;
+  return false;
+}
+
+// ---------------------------------------------------------------- 音
+let AC = null, master = null, dlyIn = null, noiseBuf = null, voices = 0;
+let dragOsc = null;
+function ensureAudio(){
+  if (AC){ if (AC.state === 'suspended'){ try { AC.resume().catch(()=>{}); } catch(e){} } return; }
+  try {
+    const A = window.AudioContext || window.webkitAudioContext; if (!A) return;
+    AC = new A();
+    master = AC.createGain(); master.gain.value = 0.85;
+    const comp = AC.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.knee.value = 12; comp.ratio.value = 4; comp.attack.value = 0.004; comp.release.value = 0.2;
+    master.connect(comp); comp.connect(AC.destination);
+    dlyIn = AC.createGain(); dlyIn.gain.value = 1;
+    const d = AC.createDelay(1.2); d.delayTime.value = STEP * 1.5;
+    const fb = AC.createGain(); fb.gain.value = 0.36;
+    const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 2400;
+    dlyIn.connect(d); d.connect(lp); lp.connect(fb); fb.connect(d); lp.connect(master);
+    const len = Math.floor(AC.sampleRate * 0.6);
+    noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+    const ch = noiseBuf.getChannelData(0); for (let i = 0; i < len; i++) ch[i] = Math.random() * 2 - 1;
+    const b = AC.createBuffer(1, 1, 22050); const s = AC.createBufferSource(); s.buffer = b; s.connect(AC.destination); s.start(0);
+    if (AC.state === 'suspended'){ AC.resume().catch(()=>{}); }
+  } catch(e){ AC = null; }
+}
+function audioReady(n){ return AC && AC.state === 'running' && voices + (n || 1) <= MAX_VOICES; }
+function at(t){ return AC.currentTime + Math.max(0, t - nowP()) + 0.005; }
+function outNode(pan){
+  if (AC.createStereoPanner){ const p = AC.createStereoPanner(); p.pan.value = clamp(pan || 0, -0.9, 0.9); p.connect(master); return p; }
+  return master;
+}
+function track(src){ voices++; src.onended = () => { voices--; }; }
+function envG(T, a, peak, d){
+  const gn = AC.createGain(); peak = Math.max(0.0002, peak);
+  gn.gain.setValueAtTime(0.0001, T); gn.gain.exponentialRampToValueAtTime(peak, T + a);
+  gn.gain.exponentialRampToValueAtTime(0.0001, T + a + d);
+  return gn;
+}
+function panX(x){ return W ? (x / W) * 2 - 1 : 0; }
+function noiseHit(T, type, f, q, a, d, vol, dest){
+  const s = AC.createBufferSource(); s.buffer = noiseBuf;
+  const fl = AC.createBiquadFilter(); fl.type = type; fl.frequency.value = f; fl.Q.value = q;
+  const gn = envG(T, a, vol, d); s.connect(fl); fl.connect(gn); gn.connect(dest);
+  s.start(T, Math.random() * 0.3); s.stop(T + a + d + 0.05); track(s);
+}
+function sStomp(t, f, heavy, vol, x){
+  if (!audioReady(2)) return; const T = at(t), dest = outNode(panX(x));
+  const o = AC.createOscillator(); o.type = 'sine';
+  o.frequency.setValueAtTime(f * 2.7, T); o.frequency.exponentialRampToValueAtTime(f, T + 0.07);
+  const gn = envG(T, 0.004, vol * (heavy ? 0.95 : 0.62), heavy ? 0.42 : 0.2);
+  o.connect(gn); gn.connect(dest); o.start(T); o.stop(T + 0.55); track(o);
+  noiseHit(T, 'bandpass', f * 9, 1.2, 0.002, 0.04, vol * 0.25, dest);
+}
+function sKnee(t, vol, x){
+  if (!audioReady(2)) return; const T = at(t), dest = outNode(panX(x));
+  noiseHit(T, 'lowpass', 1300, 0.7, 0.002, 0.07, vol * 0.5, dest);
+  const o = AC.createOscillator(); o.type = 'triangle';
+  o.frequency.setValueAtTime(340, T); o.frequency.exponentialRampToValueAtTime(190, T + 0.06);
+  const gn = envG(T, 0.003, vol * 0.28, 0.08); o.connect(gn); gn.connect(dest); o.start(T); o.stop(T + 0.15); track(o);
+}
+function sClap(t, vol, x){
+  if (!audioReady(3)) return; const T = at(t), dest = outNode(panX(x));
+  for (let i = 0; i < 3; i++) noiseHit(T + i * 0.011, 'bandpass', 1500, 0.9, 0.001, i === 2 ? 0.12 : 0.02, vol * 0.55, dest);
+}
+function sBench(t, vol, x){
+  if (!audioReady(2)) return; const T = at(t), dest = outNode(panX(x));
+  const o = AC.createOscillator(); o.type = 'sine';
+  o.frequency.setValueAtTime(96, T); o.frequency.exponentialRampToValueAtTime(46, T + 0.18);
+  const gn = envG(T, 0.004, vol * 0.85, 0.48); o.connect(gn); gn.connect(dest); o.start(T); o.stop(T + 0.6); track(o);
+  noiseHit(T, 'lowpass', 500, 0.8, 0.002, 0.06, vol * 0.3, dest);
+}
+function sPluck(t, f, dec, bright, vol, x, wet){
+  if (!audioReady(3)) return; const T = at(t), dest = outNode(panX(x));
+  const o1 = AC.createOscillator(); o1.type = 'sawtooth'; o1.frequency.value = f;
+  const o2 = AC.createOscillator(); o2.type = 'triangle'; o2.frequency.value = f * 2.003;
+  const fl = AC.createBiquadFilter(); fl.type = 'lowpass'; fl.Q.value = 2;
+  fl.frequency.setValueAtTime(500 + bright * 5200, T); fl.frequency.exponentialRampToValueAtTime(260 + bright * 300, T + dec);
+  const gn = envG(T, 0.003, vol, dec);
+  o1.connect(fl); o2.connect(fl); fl.connect(gn); gn.connect(dest);
+  if (wet > 0 && dlyIn){ const ws = AC.createGain(); ws.gain.value = wet * 0.7; gn.connect(ws); ws.connect(dlyIn); }
+  o1.start(T); o2.start(T); o1.stop(T + dec + 0.05); o2.stop(T + dec + 0.05); track(o1); track(o2);
+}
+function sTone(t, type, f, f2, a, d, vol, x){
+  if (!audioReady(1)) return; const T = at(t), dest = outNode(panX(x));
+  const o = AC.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, T);
+  if (f2 && f2 !== f) o.frequency.exponentialRampToValueAtTime(f2, T + a + d);
+  const gn = envG(T, a, vol, d); o.connect(gn); gn.connect(dest); o.start(T); o.stop(T + a + d + 0.05); track(o);
+}
+function sBlip(x, f){ sTone(nowP(), 'sine', f || 620, (f || 620) * 1.3, 0.004, 0.08, 0.12, x); }
+function sSuccess(t, x){                         // 受け渡し成功: 上がる三和音 + ぱたん
+  const r = (keyRoot || 146.83) * 2;
+  [0, 4, 7, 12].forEach((s, i) => sTone(t + i * 0.07, 'triangle', r * Math.pow(2, s/12), 0, 0.005, 0.32, 0.22, x));
+  sTone(t + 0.3, 'sine', r * 4, r * 4, 0.003, 0.5, 0.12, x);
+  sBench(t, 0.6, x);
+}
+function sRoofDone(t){                           // 屋根完成: 大きな和音のファンファーレ
+  const r = keyRoot || 146.83;
+  [[0,7,12],[2,9,14],[4,12,16]].forEach((ch, j) => ch.forEach(s =>
+    sTone(t + j * 0.18, 'triangle', r * 2 * Math.pow(2, s/12), 0, 0.01, 0.55, 0.13, W/2)));
+  sTone(t + 0.54, 'sine', r * 8, r * 8, 0.004, 0.9, 0.12, W/2);
+  sBench(t + 0.54, 0.9, W/2);
+}
+function sFinal(t){
+  const r = keyRoot || 146.83;
+  [0, 4, 7, 12, 16, 19].forEach(s => sTone(t, 'triangle', r * Math.pow(2, s/12), 0, 0.01, 1.4, 0.12, W/2));
+  sPluck(t, r, 1.6, 0.8, 0.28, W/2, 0.7);
+  sBench(t, 1.0, W/2);
+  for (let i = 0; i < 3; i++) sClap(t + i * 0.03, 0.9, kids[i].pos.x);
+}
+function sFold(t){ sTone(t, 'sine', 900, 200, 0.02, 0.9, 0.14, W/2); sPluck(t + 0.8, (keyRoot || 110), 0.5, 0.2, 0.18, W/2, 0.3); }
+function dragToneOn(){
+  if (!audioReady(2) || dragOsc) return;
+  const T = AC.currentTime;
+  const o = AC.createOscillator(); o.type = 'sawtooth'; o.frequency.value = (keyRoot || 98);
+  const o2 = AC.createOscillator(); o2.type = 'triangle'; o2.frequency.value = (keyRoot || 98) * 0.5;
+  const fl = AC.createBiquadFilter(); fl.type = 'lowpass'; fl.frequency.value = 400; fl.Q.value = 3;
+  const gn = AC.createGain(); gn.gain.setValueAtTime(0.0001, T); gn.gain.exponentialRampToValueAtTime(0.05, T + 0.05);
+  o.connect(fl); o2.connect(fl); fl.connect(gn); gn.connect(master);
+  o.start(T); o2.start(T); track(o); track(o2);
+  dragOsc = { o, o2, fl, gn };
+}
+function dragToneSet(tn){
+  if (!dragOsc || !AC) return; const T = AC.currentTime, base = keyRoot || 98;
+  dragOsc.o.frequency.setTargetAtTime(base * (1 + tn * 0.9), T, 0.03);
+  dragOsc.o2.frequency.setTargetAtTime(base * 0.5 * (1 + tn * 0.9), T, 0.03);
+  dragOsc.fl.frequency.setTargetAtTime(380 + tn * 2200, T, 0.04);
+  dragOsc.gn.gain.setTargetAtTime(0.04 + tn * 0.11, T, 0.04);
+}
+function dragToneOff(){
+  if (!dragOsc || !AC) { dragOsc = null; return; }
+  const T = AC.currentTime, d = dragOsc;
+  try { d.gn.gain.cancelScheduledValues(T); d.gn.gain.setTargetAtTime(0.0001, T, 0.03); d.o.stop(T + 0.2); d.o2.stop(T + 0.2); } catch(e){}
+  dragOsc = null;
+}
+
+// ---------------------------------------------------------------- 見た目の反応
+function ring(x, y, color, maxR, dur, lw){
+  if (rings.length >= MAX_RINGS) rings.shift();
+  rings.push({ x, y, c:color, r0:kh * 0.08, r1:maxR, t:0, dur:dur || 0.5, lw:lw || kh * 0.07 });
+}
+function burst(x, y, n, sp){
+  for (let i = 0; i < n; i++){
+    if (parts.length >= MAX_PARTICLES) parts.shift();
+    const a = Math.random() * Math.PI * 2, v = (0.4 + Math.random()) * (sp || kh * 3);
+    parts.push({ x, y, vx:Math.cos(a) * v, vy:Math.sin(a) * v - kh * 1.5, c:CLOTH[i % 3], s:kh * (0.04 + Math.random() * 0.04), life:0.7 + Math.random() * 0.4, t:0, rot:Math.random() * 3 });
+  }
+}
+function atTime(t, fn){ vq.push({ t, fn }); }
+function hitKid(k, t, vol, lead){
+  const heavy = lead === 'heavy';
+  if (k.sitting){ sKnee(t, vol, k.pos.x); atTime(t, () => { k.kneeT = 1; ring(k.pos.x, k.pos.y - kh*0.34, k.ring, kh*0.5, 0.35, kh*0.05); }); }
+  else {
+    sStomp(t, k.sf, heavy, vol, k.pos.x);
+    atTime(t - 0.11, () => { k.lift = 1; k.liftLeg = 1 - k.liftLeg; });
+    atTime(t, () => { k.lift = 0; k.squash = 1; ring(k.pos.x, k.pos.y, k.ring, kh * (lead ? 0.85 : 0.55), 0.45, kh * (lead ? 0.08 : 0.05)); if (lead){ roofVib.vy += kh * 0.5; stripVib = Math.max(stripVib, kh * 0.05); } });
+  }
+}
+function clapKid(k, t, vol){
+  sClap(t, vol, k.pos.x);
+  atTime(t, () => { k.clapT = 1; const h = kidHand(k); ring(k.pos.x, k.pos.y - kh*0.62 - kidJumpY(k), k.ring, kh*0.42, 0.3, kh*0.04); });
+}
+
+// ---------------------------------------------------------------- 伴奏（拍の進行）
+function benchSteps(i){
+  const lr = memory.lastRebound;
+  if (lr.length){ const base = lr.slice(0, 2).map(s => s % 8); return i === 0 ? base : base.map(s => s + 8); }
+  return i === 0 ? [0, 8] : [4, 12];
+}
+function activeKids(){ return kids.filter(k => k.role === 'hold' || k.role === 'clap' || k.role === 'stage'); }
+function playStep(gi, t){
+  const s = gi % 16;
+  for (let i = pend.length - 1; i >= 0; i--){ if (pend[i].g <= gi){ const p = pend[i]; pend.splice(i, 1); p.fn(t); } }
+  if (finalePending && phase === 'stage' && s % 8 === 0){ startFinale(gi); }
+  if (phase === 'finale'){ finaleStep(gi, t); return; }
+  if (phase === 'fold') return;
+  // 前回の最後の引き手は、待っている間も前回の反動の音型を小さく手拍子する
+  if (memory.prevFinal >= 0 && memory.lastRebound.length){
+    const pk = kids[memory.prevFinal];
+    if (pk.role === 'wait' && memory.lastRebound.some(r => r % 8 === s % 8)) clapKid(pk, t, 0.22);
+  }
+  if (!musicOn) return;
+  // 支柱の弦（最初の受け手で決まる出だし）
+  for (const b of BASS[opening]) if (b[0] === s){
+    sPluck(t, keyRoot * Math.pow(2, b[1] / 12), 0.34, 0.35, 0.2, Lp.poleTop.x, 0.15);
+    atTime(t, () => { poleWob = Math.max(poleWob, 0.35); ring(Lp.poleTop.x, Lp.poleTop.y, COL.K, kh*0.45, 0.35, kh*0.04); });
+  }
+  // まれに全員の拍がそろう
+  const act = activeKids();
+  if (s === 0 && act.length >= 2 && gi - lastUnison >= 32 && Math.random() < 0.1){
+    lastUnison = gi;
+    for (const k of act){ hitKid(k, t, 0.8, 'heavy'); clapKid(k, t, 0.6); }
+    sTone(t, 'triangle', keyRoot * 4, 0, 0.004, 0.6, 0.16, W/2);
+    atTime(t, () => { flash = 1; for (const k of act) k.cheer = 1; roofVib.vy += kh * 0.9; });
+    return;
+  }
+  for (const k of act){
+    const lead = (k.role === 'hold' || k.role === 'stage');
+    for (const st of k.stomps){
+      if (st.s === s && gi > st.born) hitKid(k, t, lead ? 0.9 : 0.5, lead ? (st.heavy ? 'heavy' : 'lead') : (st.heavy ? 'heavy' : null));
+    }
+    if (k.role === 'clap') for (const cs of k.clapSteps) if (cs === s) clapKid(k, t, 0.55);
+  }
+  for (let i = 0; i < 2; i++){
+    const b = benches[i];
+    if (b.shaded && benchSteps(i).indexOf(s) >= 0){
+      const f = spotFeet(b.id);
+      sBench(t, 0.7, f.x);
+      atTime(t, () => { b.bounce = 1; ring(f.x, f.y - kh * 0.3, COL.K, kh * 0.7, 0.45, kh * 0.06); });
+    }
+  }
+}
+function scheduler(){
+  const now = nowP();
+  if (nextStepTime < now - 0.25){ nextStepTime = now + 0.03; }
+  while (nextStepTime < now + 0.12){ playStep(gs, nextStepTime); nextStepTime += STEP; gs++; }
+}
+// 離した時刻にいちばん近い拍（吸着）
+function snapStep(t){
+  const off = Math.round((t - nextStepTime) / STEP);
+  const g2 = gs + off;
+  return { g:g2, t:nextStepTime + off * STEP };
+}
+
+// ---------------------------------------------------------------- 受け渡し・反動
+function addStomp(k, gi, heavy){
+  const s = ((gi % 16) + 16) % 16;
+  const ex = k.stomps.find(x => x.s === s);
+  if (ex){ ex.heavy = heavy; ex.born = gi; return; }
+  k.stomps.push({ s, heavy, born:gi });
+  while (k.stomps.length > 6) k.stomps.shift();
+}
+function startBounce(dx, dy, tn){
+  const f = 9 - 6 * tn, tau = 0.14 + 0.75 * tn;
+  handle.bounce = { dx, dy, t0:nowP(), f, tau };
+}
+function bounceOffset(t){
+  const b = handle.bounce; if (!b) return { x:0, y:0 };
+  const e = t - b.t0; if (e > b.tau * 6){ handle.bounce = null; return { x:0, y:0 }; }
+  const m = Math.exp(-e / b.tau) * Math.cos(2 * Math.PI * b.f * e);
+  return { x:b.dx * m, y:b.dy * m };
+}
+function releaseSound(t, tn, x, stage){
+  const root = keyRoot || 98;
+  const idx = clamp(Math.round((1 - tn) * 5), 0, 5);
+  const f = root * 2 * Math.pow(2, PENTA[idx] / 12);
+  const dec = 0.22 + 1.5 * tn;
+  // 張りが強いほど弦が明るく、ゆるいほど太鼓が前に出る
+  sPluck(t, f, dec, 0.25 + tn * 0.75, 0.16 + 0.2 * tn, x, tn * (stage ? 1 : 0.8));
+  sBench(t, 0.35 + 0.5 * (1 - tn) + (stage ? 0.3 : 0), x);
+  const fr = 9 - 6 * tn, n = 2 + Math.round(tn * 2);
+  for (let i = 1; i <= n; i++) sPluck(t + i / (2 * fr), f * (tn < 0.35 ? 1 : 0.5), 0.1 + 0.3 * tn, 0.3, 0.08 * (1 - i / (n + 1)), x, 0);
+  return f;
+}
+function springRelease(dx, dy, d){
+  const tn = clamp(d / (1.6 * kh), 0, 1), t = nowP();
+  startBounce(dx, dy, tn);
+  stripVib = Math.max(stripVib, kh * (0.06 + 0.3 * tn));
+  if (d < kh * 0.12){ sPluck(t, (keyRoot || 98) * 4, 0.16, 0.5, 0.1, handle.x, 0); return; }
+  releaseSound(t, tn, handle.x, false);
+  const r = handleRest();
+  burst(r.x, r.y, 3 + Math.round(tn * 5), kh * (1 + 2 * tn));
+  ring(r.x, r.y, COL.K, kh * (0.4 + 0.8 * tn), 0.3 + 0.5 * tn, kh * 0.05);
+  if (holder >= 0){
+    const k = kids[holder];
+    const sn = snapStep(t);
+    addStomp(k, sn.g, tn > 0.45);
+    hitKid(k, Math.max(t, sn.t), 0.9, tn > 0.45 ? 'heavy' : 'lead');
+    k.reach = 1;
+  }
+}
+function handoff(ki){
+  const t = nowP();
+  const prev = holder;
+  const k = kids[ki];
+  const from = { x:handle.x, y:handle.y };
+  if (prev >= 0){
+    const pk = kids[prev];
+    corners[corners.length - 1] = { kind:'stake', spot:pk.spot, grow:0 };
+    pk.role = 'clap';
+    const cs = []; for (const st of pk.stomps){ const c = (st.s + 2) % 16; if (cs.indexOf(c) < 0) cs.push(c); }
+    pk.clapSteps = cs.length ? cs.slice(0, 4) : [4, 12];
+    pk.cheer = 0.6;
+  }
+  corners.push({ kind:'kid', k:ki });
+  holder = ki; order.push(ki);
+  k.role = 'hold'; k.jump = 1; k.cheer = 1;
+  if (order.length === 1){ opening = ki; keyRoot = KEYS[ki]; musicOn = true; }
+  if (!k.stomps.length){ k.stomps = k.defStomp.map(s => ({ s, heavy:k.heavyDef, born:-1 })); }
+  const r = handleRest();
+  handle.bounce = { dx:from.x - r.x, dy:from.y - r.y, t0:t, f:5, tau:0.12 };
+  handle.hop = 1;
+  sSuccess(t, k.pos.x);
+  burst(r.x, r.y, 14);
+  ring(r.x, r.y, k.ring, kh * 1.1, 0.6, kh * 0.09);
+  ring(r.x, r.y, COL.K, kh * 1.5, 0.75, kh * 0.05);
+  stripVib = kh * 0.3;
+  roofVib.vy += kh * 1.2;
+  if (order.length === 3){ toStageAt = t + 0.75; }
+}
+function moveHolder(spot){
+  const k = kids[holder]; if (!k) return;
+  k.spot = spot;
+  const t = nowP();
+  if (spotSit(spot)){ sTone(t, 'sine', 420, 200, 0.01, 0.25, 0.14, k.pos.x); sKnee(t + 0.3, 0.5, k.pos.x); }
+  else { sTone(t, 'sine', 260, 520, 0.01, 0.22, 0.14, k.pos.x); }
+  stripVib = kh * 0.2;
+}
+function startToStage(){
+  const t = nowP();
+  toStageAt = 0;
+  const fk = kids[holder];
+  corners[corners.length - 1] = { kind:'stake', spot:fk.spot, grow:0, big:true };
+  phase = 'toStage'; toStage = { t0:t, p:0 };
+  fk.role = 'stage'; fk.spot = 'st'; fk.cheer = 1;
+  sRoofDone(t);
+  const c = airCentroid();
+  burst(c.x, c.y, 24, kh * 4);
+  ring(c.x, c.y, COL.R, kh * 2.4, 0.9, kh * 0.12);
+  ring(c.x, c.y, COL.Y, kh * 1.8, 0.8, kh * 0.1);
+  for (const k of kids){ k.jump = 1; }
+  handle.hop = 1;
+}
+function stageRelease(dx, dy, d){
+  const tn = clamp(d / (1.6 * kh), 0, 1), t = nowP();
+  startBounce(dx, dy, tn);
+  if (d < kh * 0.12){ sPluck(t, (keyRoot || 98) * 4, 0.16, 0.5, 0.1, handle.x, 0); return; }
+  const f = releaseSound(t, tn, handle.x, true);
+  const c = fanCenter();
+  burst(c.x, c.y, 4 + Math.round(tn * 6), kh * (1.5 + 2 * tn));
+  ring(c.x, c.y, COL.R, kh * (0.8 + 1.2 * tn), 0.4 + 0.6 * tn, kh * 0.08);
+  const sn = snapStep(t);
+  const fk = kids[holder];
+  addStomp(fk, sn.g, tn > 0.45);
+  hitKid(fk, Math.max(t, sn.t), 0.9, tn > 0.45 ? 'heavy' : 'lead');
+  stageRec.push({ s:((sn.g % 16) + 16) % 16, long:tn > 0.45 });
+  while (stageRec.length > 4) stageRec.shift();
+  memory.lastRebound = stageRec.map(r => r.s);
+  stageHits = Math.min(STAGE_HITS, stageHits + 1);
+  // 屋根が小さく反動を返す（1拍後のこだま）
+  pend.push({ g:sn.g + 2, fn:(tt) => { sPluck(tt, f * 1.5, 0.3 + 0.4 * tn, 0.4, 0.09, Lp.poleTop.x, 0.4); atTime(tt, () => { roofVib.vy += kh * (0.3 + 0.6 * tn); const cc = fanCenter(); ring(cc.x, cc.y, COL.Y, kh * 0.9, 0.4, kh * 0.06); }); } });
+  // 拍手係が掛け合いで答える
+  pend.push({ g:sn.g + 4, fn:(tt) => {
+    for (const k of kids){ if (k.role === 'clap'){ clapKid(k, tt, 0.6); if (tn > 0.45) clapKid(k, tt + STEP, 0.5); } }
+  } });
+  if (stageHits >= STAGE_HITS) finalePending = true;
+}
+function mimicPattern(){
+  const rec = stageRec.length ? stageRec : [{ s:0, long:true }, { s:2, long:false }, { s:4, long:true }, { s:6, long:false }];
+  const first = rec[0].s;
+  return rec.map(r => ({ r:((r.s - first + 16) % 16) % 8, long:r.long }));
+}
+function startFinale(gi){
+  phase = 'finale';
+  finale = { g0:gi, pat:mimicPattern() };
+  finalePending = false;
+  if (handle.drag){ handle.drag = false; activePid = null; dragToneOff(); }
+}
+function finaleStep(gi, t){
+  const f = gi - finale.g0;
+  const o = order.length === 3 ? order : [0, 1, 2];
+  if (f % 8 === 0 && f < 24) sPluck(t, keyRoot * (f < 16 ? 1 : 1.5), 0.4, 0.4, 0.2, Lp.poleTop.x, 0.2);
+  const hits = finale.pat.filter(p => p.r === f % 8);
+  if (f < 8){ for (const h of hits) hitKid(kids[o[0]], t, 0.85, h.long ? 'heavy' : 'lead'); }
+  else if (f < 16){ for (const h of hits){ hitKid(kids[o[0]], t, 0.8, h.long ? 'heavy' : 'lead'); clapKid(kids[o[1]], t, 0.7); } }
+  else if (f < 24){
+    for (const h of hits){ hitKid(kids[o[0]], t, 0.8, 'heavy'); clapKid(kids[o[1]], t, 0.7); hitKid(kids[o[2]], t, 0.8, h.long ? 'heavy' : 'lead'); }
+    if (f % 2 === 0) for (const k of kids) clapKid(k, t + (k.id * 0.02), 0.45 + (f - 16) * 0.04);
+    if (hits.length) atTime(t, () => { roofVib.vy += kh * 0.7; });
+  }
+  else if (f === 24){
+    sFinal(t);
+    atTime(t, () => {
+      flash = 1;
+      for (const k of kids){ k.jump = 1; k.cheer = 1; }
+      const c = fanCenter(); burst(c.x, c.y, 34, kh * 5);
+      ring(c.x, c.y, COL.R, kh * 3, 1.0, kh * 0.14); ring(c.x, c.y, COL.B, kh * 2.2, 0.9, kh * 0.1); ring(c.x, c.y, COL.Y, kh * 1.4, 0.8, kh * 0.08);
+      roofVib.vy += kh * 2;
+    });
+  }
+  else if (f === 28){ startFold(t); }
+}
+function startFold(t){
+  memory.orders.push(order.slice());
+  memory.prevFinal = order[order.length - 1];
+  fold = { t0:t, p:0, from:fanCenter(), hfrom:{ x:handle.x, y:handle.y } };
+  phase = 'fold';
+  for (const k of kids){ k.spot = k.home; }
+  sFold(t);
+}
+function endFold(){
+  fold = null;
+  corners = [{ kind:'pole' }];
+  holder = -1; order = [];
+  for (const k of kids){ k.role = 'wait'; k.clapSteps = []; k.spot = k.home; }
+  stageHits = 0; stageRec = []; finale = null; finalePending = false;
+  musicOn = false; opening = -1; keyRoot = 0;
+  phase = 'relay'; cycle++;
+  demo.shownRelay = false; demo.shownStage = false;
+  lastInput = nowP();
+  handle.bounce = null; handle.hop = 1;
+  pend.length = 0;
+}
+
+// ---------------------------------------------------------------- 入力
+function pt(e){ return { x:e.clientX, y:e.clientY }; }
+function findTarget(px, py){
+  if (phase !== 'relay') return null;
+  let best = null, bd = 1e9;
+  for (const k of kids){
+    if (k.role !== 'wait') continue;
+    const h = kidHand(k);
+    const d = distSeg(px, py, h.x, h.y - kh * 0.1, k.pos.x, k.pos.y - kh * 0.2);
+    if (d < kh * 0.85 && d < bd){ bd = d; best = { type:'kid', k:k.id }; }
+  }
+  if (best) return best;
+  if (holder < 0) return null;
+  const hk = kids[holder], r = handleRest();
+  if (dist(px, py, r.x, r.y) < kh * 0.38) return null;
+  for (const b of benches){
+    if (!benchFree(b.id) || hk.spot === b.id) continue;
+    const h = spotHand(b.id), f = spotFeet(b.id);
+    if (distSeg(px, py, h.x, h.y, f.x, f.y - kh * 0.2) < kh * 0.5) return { type:'bench', id:b.id };
+  }
+  if (spotSit(hk.spot)){
+    const h = spotHand(hk.home), f = spotFeet(hk.home);
+    if (distSeg(px, py, h.x, h.y, f.x, f.y - kh * 0.2) < kh * 0.62) return { type:'home', id:hk.home };
+  }
+  return null;
+}
+function benchFree(id){
+  for (const k of kids) if (k.spot === id) return false;
+  for (const c of corners) if (c.kind === 'stake' && c.spot === id) return false;
+  return true;
+}
+function pokeAt(p){
+  for (const k of kids){
+    if (Math.abs(p.x - k.pos.x) < kh * 0.3 && p.y < k.pos.y + kh * 0.05 && p.y > k.pos.y - kh * 1.15){ k.wob = 1; sBlip(k.pos.x, 500 + k.id * 120); return; }
+  }
+  for (const b of benches){
+    const f = spotFeet(b.id);
+    if (Math.abs(p.x - f.x) < kh * 0.4 && p.y < f.y + kh * 0.05 && p.y > f.y - kh * 0.45){ b.wob = 1; sBlip(f.x, 300); return; }
+  }
+  if (Math.abs(p.x - Lp.poleTop.x) < kh * 0.15 && p.y > Lp.poleTop.y - kh * 0.1 && p.y < Lp.poleBase.y){ poleWob = 0.6; sBlip(Lp.poleTop.x, 800); }
+}
+function onDown(e){
+  e.preventDefault();
+  ensureAudio();
+  lastInput = nowP();
+  demo.active = false;
+  if (activePid !== null) return;                // 余分な指は無視
+  const p = pt(e);
+  if (canGrab() && dist(p.x, p.y, handle.x, handle.y) < grabR){
+    activePid = e.pointerId;
+    try { cv.setPointerCapture(e.pointerId); } catch(err){}
+    handle.drag = true; handle.bounce = null;
+    handle.fx = p.x; handle.fy = p.y;
+    handle.squash = 1; handle.pressT = nowP();
+    stripVib = Math.max(stripVib, kh * 0.12);
+    firstTouchDone = true;
+    const t = nowP();
+    sPluck(t, (keyRoot || 98) * 3, 0.18, 0.6, 0.14, p.x, 0);
+    dragToneOn();
+    ring(handle.x, handle.y, COL.K, grabR * 1.4, 0.3, kh * 0.05);
+    return;
+  }
+  pokeAt(p);
+}
+function onMove(e){
+  if (e.pointerId !== activePid || !handle.drag) return;
+  e.preventDefault();
+  handle.fx = clamp(e.clientX, X0 + 8, X0 + UW - 8);
+  handle.fy = clamp(e.clientY, Y0 + 8, Y0 + UH - 8);
+  lastInput = nowP();
+}
+function releaseDrag(cancel){
+  if (!handle.drag){ activePid = null; return; }
+  const rest = handleRest();
+  const dx = handle.x - rest.x, dy = handle.y - rest.y, d = Math.hypot(dx, dy);
+  const tg = cancel ? null : findTarget(handle.fx, handle.fy);
+  handle.drag = false; activePid = null; handle.hover = null;
+  dragToneOff();
+  lastInput = nowP();
+  if (cancel){ startBounce(dx, dy, clamp(d / (1.6 * kh), 0, 1) * 0.4); return; }
+  if (phase === 'relay'){
+    if (tg && tg.type === 'kid'){ handoff(tg.k); return; }
+    if (tg && (tg.type === 'bench' || tg.type === 'home')){ moveHolder(tg.id); startBounce(dx, dy, 0.25); return; }
+    springRelease(dx, dy, d);
+  } else if (phase === 'stage'){
+    stageRelease(dx, dy, d);
+  } else {
+    startBounce(dx, dy, 0.3);
+  }
+}
+function onUp(e){ if (e.pointerId === activePid){ e.preventDefault(); releaseDrag(false); } }
+function onCancel(e){ if (e.pointerId === activePid) releaseDrag(true); }
+cv.addEventListener('pointerdown', onDown, { passive:false });
+cv.addEventListener('pointermove', onMove, { passive:false });
+cv.addEventListener('pointerup', onUp, { passive:false });
+cv.addEventListener('pointercancel', onCancel);
+cv.addEventListener('lostpointercapture', onCancel);
+window.addEventListener('pointerup', onUp);
+window.addEventListener('blur', () => { if (activePid !== null) releaseDrag(true); });
+['contextmenu', 'gesturestart', 'gesturechange', 'dblclick', 'selectstart'].forEach(n =>
+  document.addEventListener(n, e => e.preventDefault(), { passive:false }));
+document.addEventListener('touchmove', e => e.preventDefault(), { passive:false });
+document.addEventListener('touchstart', e => { if (e.touches.length > 1) e.preventDefault(); }, { passive:false });
+
+// ---------------------------------------------------------------- 更新
+function updateBenches(){
+  const fl = []; for (const c of corners) fl.push(cornerFloor(c));
+  const segs = [];
+  for (let i = 0; i + 1 < fl.length; i++) segs.push([fl[i], fl[i+1], shR]);
+  if (fl.length >= 3) segs.push([fl[fl.length-1], fl[0], shR]);
+  const ss = stripStart(), hf = { x:handle.x, y:handle.y + handH };
+  const sf = (phase === 'stage' || phase === 'finale' || phase === 'toStage') ? stageFeet() : fl[fl.length - 1];
+  segs.push([sf, hf, shR * 0.8]);
+  for (const b of benches){
+    const f = spotFeet(b.id);
+    const pts = [{ x:f.x, y:f.y }, { x:f.x - kh*0.25, y:f.y }, { x:f.x + kh*0.25, y:f.y }];
+    let sh = false;
+    for (const p of pts){
+      if (fl.length >= 3 && inPoly(p.x, p.y, fl)){ sh = true; break; }
+      for (const s of segs){ if (distSeg(p.x, p.y, s[0].x, s[0].y, s[1].x, s[1].y) < s[2]){ sh = true; break; } }
+      if (sh) break;
+    }
+    if (phase === 'fold') sh = false;
+    b.shaded = sh;
+  }
+}
+function update(dt, t){
+  scheduler();
+  for (let i = vq.length - 1; i >= 0; i--){ if (vq[i].t <= t){ const f = vq[i].fn; vq.splice(i, 1); f(); } }
+  if (vq.length > 200) vq.splice(0, vq.length - 200);
+
+  if (toStageAt && t >= toStageAt && phase === 'relay') startToStage();
+  if (phase === 'toStage' && toStage){
+    toStage.p = (t - toStage.t0) / 1.2;
+    const fk = kids[holder], sf = stageFeet();
+    if (toStage.p >= 1 && dist(fk.pos.x, fk.pos.y, sf.x, sf.y) < kh * 0.15){ phase = 'stage'; toStage = null; lastInput = t; }
+  }
+  if (phase === 'fold' && fold){ fold.p = (t - fold.t0) / 1.8; if (fold.p >= 1) endFold(); }
+
+  // 人物
+  const rest = handleRest();
+  for (const k of kids){
+    const f = spotFeet(k.spot);
+    const sp = Math.min(1, dt * 5);
+    k.pos.x += (f.x - k.pos.x) * sp; k.pos.y += (f.y - k.pos.y) * sp;
+    k.sitting = spotSit(k.spot) && dist(k.pos.x, k.pos.y, f.x, f.y) < kh * 0.12;
+    let lt = 0;
+    if (k.role === 'wait' && (phase === 'relay')){
+      const dx = handle.x - k.pos.x;
+      const eager = (cycle > 0 && memory.prevFinal === k.id) ? 0.3 : 0.2;
+      lt = clamp(dx / (kh * 4), -1, 1) * eager;
+      if (handle.hover && handle.hover.type === 'kid' && handle.hover.k === k.id) lt = clamp(dx / (kh * 1.5), -1, 1) * 0.42;
+      lt += Math.sin(t * 2.2 + k.seed) * 0.03;
+    } else if (k.role === 'hold' && handle.drag){
+      lt = clamp((handle.x - k.pos.x) / (kh * 5), -0.2, 0.2);
+    }
+    k.lean += (lt - k.lean) * Math.min(1, dt * 8);
+    k.reach = (k.role === 'wait' && handle.hover && handle.hover.k === k.id) ? Math.min(1, k.reach + dt * 6) : Math.max(0, k.reach - dt * 3);
+    k.jump = Math.max(0, k.jump - dt * 1.7);
+    k.cheer = Math.max(0, k.cheer - dt * 0.9);
+    k.squash = Math.max(0, k.squash - dt * 6);
+    k.clapT = Math.max(0, k.clapT - dt * 5);
+    k.kneeT = Math.max(0, k.kneeT - dt * 5);
+    k.wob = Math.max(0, k.wob - dt * 2.5);
+    k.lift = Math.max(0, k.lift - dt * 4);
+  }
+  for (const c of corners) if (c.kind === 'stake') c.grow = Math.min(1, (c.grow || 0) + dt * 5);
+  for (const b of benches){ b.bounce = Math.max(0, b.bounce - dt * 5); b.wob = Math.max(0, b.wob - dt * 2.5); }
+  poleWob = Math.max(0, poleWob - dt * 2.5);
+  flash = Math.max(0, flash - dt * 2.5);
+  stripVib *= Math.exp(-dt * 3);
+  // 屋根のばね
+  roofVib.vx += (-roofVib.x * 160 - roofVib.vx * 9) * dt;
+  roofVib.vy += (-roofVib.y * 160 - roofVib.vy * 9) * dt;
+  roofVib.x += roofVib.vx * dt; roofVib.y += roofVib.vy * dt;
+  roofVib.y = clamp(roofVib.y, -kh, kh);
+
+  // 取っ手
+  if (handle.drag){
+    let tx = handle.fx, ty = handle.fy;
+    handle.hover = findTarget(tx, ty);
+    if (handle.hover && handle.hover.type === 'kid'){ const h = kidHand(kids[handle.hover.k]); tx = lerp(tx, h.x, 0.45); ty = lerp(ty, h.y - kh * 0.1, 0.45); }
+    else if (handle.hover){ const h = spotHand(handle.hover.id); tx = lerp(tx, h.x, 0.3); ty = lerp(ty, h.y, 0.3); }
+    handle.x = tx; handle.y = ty;
+    const d = dist(handle.x, handle.y, rest.x, rest.y);
+    dragToneSet(clamp(d / (1.6 * kh), 0, 1));
+  } else {
+    const o = bounceOffset(t);
+    handle.x = rest.x + o.x + demo.ox; handle.y = rest.y + o.y + demo.oy;
+    if (handle.bounce && Math.hypot(o.x, o.y) > 1) stripVib = Math.max(stripVib, Math.min(kh * 0.25, Math.hypot(o.x, o.y) * 0.2));
+  }
+  handle.squash = Math.max(handle.drag ? 0.35 : 0, handle.squash - dt * 5);
+  handle.hop = Math.max(0, handle.hop - dt * 2.2);
+
+  // お手本（約4秒操作なし、各段階で1回だけ）
+  const wantDemo = !handle.drag && !demo.active && t - lastInput > 4 &&
+    ((phase === 'relay' && canGrab() && !demo.shownRelay) || (phase === 'stage' && canGrab() && !demo.shownStage));
+  if (wantDemo){ demo.active = true; demo.t0 = t; if (phase === 'relay') demo.shownRelay = true; else demo.shownStage = true; }
+  demo.ox = 0; demo.oy = 0; demo.press = 0;
+  if (demo.active){
+    const e = t - demo.t0;
+    let dirx = 0, diry = 1, len = kh * 0.7;
+    if (phase === 'relay'){
+      let best = null, bd = 1e9;
+      for (const k of kids){ if (k.role !== 'wait') continue; const h = kidHand(k); const d = dist(h.x, h.y, rest.x, rest.y); if (d < bd){ bd = d; best = h; } }
+      if (best){ dirx = (best.x - rest.x) / bd; diry = (best.y - rest.y) / bd; len = Math.min(bd * 0.4, kh * 1.4); }
+    }
+    let pull = 0;
+    if (e < 0.35) pull = 0; else if (e < 1.25) pull = ease((e - 0.35) / 0.9); else if (e < 1.45) pull = 1; else if (e < 1.6) pull = 1 - (e - 1.45) / 0.15; else pull = 0;
+    demo.press = e > 0.25 && e < 1.5 ? 1 : 0;
+    demo.ox = dirx * len * pull; demo.oy = diry * len * pull;
+    demo.x = rest.x + dirx * len * pull; demo.y = rest.y + diry * len * pull;
+    if (e > 1.45 && e < 1.47 && !demo.bounced){ demo.bounced = true; handle.bounce = { dx:dirx * len * 0.3, dy:diry * len * 0.3, t0:t, f:6, tau:0.2 }; }
+    if (e > 2.3 || !canGrab()){ demo.active = false; demo.bounced = false; }
+  }
+
+  updateBenches();
+  for (let i = rings.length - 1; i >= 0; i--){ rings[i].t += dt; if (rings[i].t >= rings[i].dur) rings.splice(i, 1); }
+  for (let i = parts.length - 1; i >= 0; i--){
+    const p = parts[i]; p.t += dt; if (p.t >= p.life){ parts.splice(i, 1); continue; }
+    p.vy += kh * 7 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.rot += dt * 6;
+  }
+}
+
+// ---------------------------------------------------------------- 描画
+function drawBackground(){
+  g.fillStyle = COL.W; g.fillRect(0, 0, W, H);
+  const hz = Lp.horizon, lw = Math.max(4, kh * 0.05);
+  g.fillStyle = COL.K;
+  g.fillRect(0, hz - lw / 2, W, lw);
+  // 奥の建物（平らな色面と太い黒線）
+  const bw = Math.min(UW * 0.16, kh * 1.2), top = Math.max(0, hz - kh * 1.25);
+  g.fillStyle = COL.R; g.fillRect(X0 + UW * 0.02, top, bw, hz - top);
+  g.fillStyle = COL.B; g.fillRect(X0 + UW * 0.98 - bw * 0.8, top + kh * 0.35, bw * 0.8, hz - top - kh * 0.35);
+  g.fillStyle = COL.Y; g.fillRect(X0 + UW * 0.02 + bw, top + kh * 0.55, bw * 0.45, hz - top - kh * 0.55);
+  g.lineWidth = lw; g.strokeStyle = COL.K;
+  g.strokeRect(X0 + UW * 0.02, top, bw, hz - top);
+  g.strokeRect(X0 + UW * 0.02 + bw, top + kh * 0.55, bw * 0.45, hz - top - kh * 0.55);
+  g.strokeRect(X0 + UW * 0.98 - bw * 0.8, top + kh * 0.35, bw * 0.8, hz - top - kh * 0.35);
+  // 広場の大きな区切り線
+  g.lineWidth = Math.max(2, kh * 0.025);
+  g.beginPath();
+  g.moveTo(X0 + UW * 0.5 - UW * 0.38, H); g.lineTo(X0 + UW * 0.5 - UW * 0.12, hz);
+  g.moveTo(X0 + UW * 0.5 + UW * 0.38, H); g.lineTo(X0 + UW * 0.5 + UW * 0.12, hz);
+  g.stroke();
+}
+function drawShade(){
+  const fl = []; for (const c of corners) fl.push(cornerFloor(c));
+  g.fillStyle = COL.B; g.strokeStyle = COL.B; g.lineJoin = 'round'; g.lineCap = 'round';
+  if (fl.length >= 2){
+    g.lineWidth = shR * 2;
+    g.beginPath(); g.moveTo(fl[0].x, fl[0].y);
+    for (let i = 1; i < fl.length; i++) g.lineTo(fl[i].x, fl[i].y);
+    if (fl.length >= 3){ g.closePath(); g.fill(); }
+    g.stroke();
+  }
+  const sf = (phase === 'stage' || phase === 'finale' || phase === 'toStage') ? stageFeet() : fl[fl.length - 1];
+  const hf = { x:handle.x, y:handle.y + handH * (phase === 'relay' && holder < 0 ? 0.75 : 1) };
+  let sc = fold ? Math.max(0, 1 - fold.p) : 1;
+  if (phase === 'relay' && holder < 0){ const r = handleRest(); sc *= clamp(dist(handle.x, handle.y, r.x, r.y) / (kh * 0.9), 0, 1); }
+  g.lineWidth = shR * 1.6 * sc;
+  if (g.lineWidth > 1){ g.beginPath(); g.moveTo(sf.x, sf.y); g.lineTo(hf.x, hf.y); g.stroke(); }
+}
+function drawBench(b){
+  const f = spotFeet(b.id);
+  const w = kh * 0.72, h = kh * 0.12, lw = Math.max(2.5, kh * 0.03);
+  const wob = Math.sin(b.wob * 20) * b.wob * kh * 0.04;
+  const by = f.y - kh * 0.3 - b.bounce * kh * 0.05;
+  g.fillStyle = COL.K;
+  g.fillRect(f.x - w * 0.42 + wob, by, kh * 0.06, f.y - by);
+  g.fillRect(f.x + w * 0.42 - kh * 0.06 + wob, by, kh * 0.06, f.y - by);
+  g.fillStyle = b.shaded ? COL.R : COL.Y;
+  g.fillRect(f.x - w / 2 + wob, by - h, w, h);
+  g.lineWidth = lw; g.strokeStyle = COL.K; g.strokeRect(f.x - w / 2 + wob, by - h, w, h);
+  g.beginPath(); g.moveTo(f.x + wob, by - h); g.lineTo(f.x + wob, by); g.stroke();
+}
+function drawPole(){
+  const w = Math.sin(poleWob * 25) * poleWob * kh * 0.04;
+  const lw = kh * 0.08;
+  g.fillStyle = COL.K;
+  g.beginPath(); g.moveTo(Lp.poleBase.x - lw / 2, Lp.poleBase.y); g.lineTo(Lp.poleBase.x + lw / 2, Lp.poleBase.y);
+  g.lineTo(Lp.poleTop.x + lw / 2 + w, Lp.poleTop.y); g.lineTo(Lp.poleTop.x - lw / 2 + w, Lp.poleTop.y); g.closePath(); g.fill();
+  g.fillRect(Lp.poleBase.x - kh * 0.2, Lp.poleBase.y - kh * 0.04, kh * 0.4, kh * 0.08);
+  // 反動演奏の旗（弾いた回数だけ増える）
+  for (let i = 0; i < stageHits; i++){
+    const y = Lp.poleTop.y + kh * 0.22 + i * kh * 0.15, x = Lp.poleTop.x - lw / 2 + w;
+    const sx = i % 2 ? 1 : -1;
+    g.fillStyle = CLOTH[i % 3];
+    g.beginPath(); g.moveTo(x + (sx > 0 ? lw : 0), y); g.lineTo(x + (sx > 0 ? lw : 0) + sx * kh * 0.3, y + kh * 0.06); g.lineTo(x + (sx > 0 ? lw : 0), y + kh * 0.12); g.closePath(); g.fill();
+    g.lineWidth = Math.max(2, kh * 0.02); g.strokeStyle = COL.K; g.stroke();
+  }
+  const r = kh * (0.09 + flash * 0.05);
+  g.fillStyle = flash > 0.5 ? COL.R : COL.Y; g.beginPath(); g.arc(Lp.poleTop.x + w, Lp.poleTop.y, r, 0, Math.PI * 2); g.fill();
+  g.lineWidth = Math.max(2.5, kh * 0.03); g.strokeStyle = COL.K; g.stroke();
+}
+function drawStakes(){
+  for (let i = 0; i < corners.length; i++){
+    const c = corners[i]; if (c.kind !== 'stake') continue;
+    const a = cornerAir(c, i), f = cornerFloor(c);
+    const gr = c.grow || 0, sc = fold ? Math.max(0, 1 - fold.p * 1.4) : 1;
+    const top = { x:lerp(f.x, a.x, gr * sc), y:lerp(f.y, a.y, gr * sc) };
+    g.strokeStyle = COL.K; g.lineCap = 'butt'; g.lineWidth = kh * (c.big ? 0.075 : 0.055);
+    g.beginPath(); g.moveTo(f.x, f.y); g.lineTo(top.x, top.y); g.stroke();
+    g.fillStyle = COL.K; g.fillRect(f.x - kh * 0.12, f.y - kh * 0.03, kh * 0.24, kh * 0.06);
+    if (c.big && gr * sc > 0.9){ g.fillStyle = COL.R; g.beginPath(); g.arc(top.x, top.y, kh * 0.07, 0, Math.PI * 2); g.fill(); g.lineWidth = Math.max(2, kh * 0.025); g.stroke(); }
+  }
+}
+function drawRibbon(a, b, w, n, sag, off, lw){
+  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+  if (len < 3) return;
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2 + sag;
+  const L1 = [], L2 = [];
+  for (let i = 0; i <= n; i++){
+    const t = i / n, u = 1 - t;
+    const cx = u*u*a.x + 2*u*t*mx + t*t*b.x, cy = u*u*a.y + 2*u*t*my + t*t*b.y;
+    const tx = 2*u*(mx - a.x) + 2*t*(b.x - mx), ty = 2*u*(my - a.y) + 2*t*(b.y - my);
+    const tl = Math.hypot(tx, ty) || 1;
+    const hw = w / 2 * (0.75 + 0.25 * Math.sin(Math.PI * t));
+    L1.push({ x:cx - ty / tl * hw, y:cy + tx / tl * hw }); L2.push({ x:cx + ty / tl * hw, y:cy - tx / tl * hw });
+  }
+  g.lineJoin = 'round'; g.strokeStyle = COL.K; g.lineWidth = lw;
+  for (let i = 0; i < n; i++){
+    g.fillStyle = CLOTH[(i + off) % 3];
+    g.beginPath(); g.moveTo(L1[i].x, L1[i].y); g.lineTo(L1[i+1].x, L1[i+1].y); g.lineTo(L2[i+1].x, L2[i+1].y); g.lineTo(L2[i].x, L2[i].y); g.closePath();
+    g.fill(); g.stroke();
+  }
+}
+function drawRoof(t){
+  const n = corners.length;
+  const air = []; for (let i = 0; i < n; i++) air.push(cornerAir(corners[i], i));
+  const lw = Math.max(2.5, kh * 0.032);
+  const vib = Math.sin(t * 28) * stripVib;
+  if (n >= 3 || phase === 'stage' || phase === 'finale' || phase === 'toStage'){
+    const c = fanCenter();
+    const R = 3;
+    g.lineJoin = 'round'; g.strokeStyle = COL.K; g.lineWidth = lw;
+    for (let i = 0; i < n; i++){
+      const v1 = air[i], v2 = air[(i + 1) % n];
+      for (let r = 0; r < R; r++){
+        const t0 = r / R, t1 = (r + 1) / R;
+        g.fillStyle = CLOTH[(i + r + cycle) % 3];
+        g.beginPath();
+        g.moveTo(lerp(c.x, v1.x, t0), lerp(c.y, v1.y, t0));
+        g.lineTo(lerp(c.x, v1.x, t1), lerp(c.y, v1.y, t1));
+        g.lineTo(lerp(c.x, v2.x, t1), lerp(c.y, v2.y, t1));
+        g.lineTo(lerp(c.x, v2.x, t0), lerp(c.y, v2.y, t0));
+        g.closePath(); g.fill(); g.stroke();
+      }
+    }
+  }
+  // 縁の帯（布のへり）
+  for (let i = 0; i + 1 < n; i++) drawRibbon(air[i], air[i + 1], cw, 4, kh * 0.1 + vib * 0.4, i + cycle, lw);
+  if (n >= 3) drawRibbon(air[n - 1], air[0], cw, 4, kh * 0.1 + vib * 0.4, n + cycle, lw);
+  // 取っ手へ伸びる帯（指で引いている部分）
+  const a = stripStart();
+  const r = handleRest();
+  const d = dist(handle.x, handle.y, r.x, r.y);
+  const tn = clamp(d / (1.6 * kh), 0, 1);
+  const sag = (holder < 0 && phase === 'relay' ? kh * 0.05 : kh * 0.18 * (1 - tn)) + vib;
+  drawRibbon(a, { x:handle.x, y:handle.y }, cw * (1 - 0.35 * tn), 5, sag, 1 + order.length, lw);
+}
+function rotP(cx, cy, x, y, a){ const c = Math.cos(a), s = Math.sin(a); return { x:cx + x * c - y * s, y:cy + x * s + y * c }; }
+function drawKid(k, t){
+  const s = kh, p = k.pos;
+  const jy = kidJumpY(k);
+  const wob = Math.sin(k.wob * 22) * k.wob * 0.12;
+  const lean = k.lean + wob + (k.cheer > 0 ? Math.sin(t * 14) * 0.05 * k.cheer : 0);
+  const sit = k.sitting;
+  const sq = k.squash * 0.05 * s;
+  const hip = { x:p.x, y:p.y - (sit ? 0.36 : 0.42) * s - jy + sq };
+  const lw = Math.max(3, s * 0.065);
+  g.lineCap = 'round'; g.lineJoin = 'round'; g.strokeStyle = COL.K;
+  // 脚
+  g.lineWidth = lw;
+  g.beginPath();
+  if (sit){
+    g.moveTo(hip.x - s * 0.06, hip.y); g.lineTo(hip.x - s * 0.12, hip.y + s * 0.06); g.lineTo(hip.x - s * 0.12, p.y);
+    g.moveTo(hip.x + s * 0.06, hip.y); g.lineTo(hip.x + s * 0.12, hip.y + s * 0.06); g.lineTo(hip.x + s * 0.12, p.y);
+  } else {
+    const lf = k.lift * s * 0.12;
+    const fy = p.y - jy * 0.85;
+    g.moveTo(hip.x - s * 0.05, hip.y); g.lineTo(hip.x - s * 0.09, fy - (k.liftLeg === 0 ? lf : 0));
+    g.moveTo(hip.x + s * 0.05, hip.y); g.lineTo(hip.x + s * 0.09, fy - (k.liftLeg === 1 ? lf : 0));
+  }
+  g.stroke();
+  // 靴
+  g.fillStyle = COL.K;
+  const fy2 = sit ? p.y : p.y - jy * 0.85;
+  const fx = sit ? 0.12 : 0.09;
+  g.fillRect(hip.x - s * fx - s * 0.07, fy2 - s * 0.04 - (!sit && k.liftLeg === 0 ? k.lift * s * 0.12 : 0), s * 0.09, s * 0.05);
+  g.fillRect(hip.x + s * fx - s * 0.02, fy2 - s * 0.04 - (!sit && k.liftLeg === 1 ? k.lift * s * 0.12 : 0), s * 0.09, s * 0.05);
+  // 胴
+  g.save(); g.translate(hip.x, hip.y); g.rotate(lean);
+  const bw = s * 0.3, bh = s * 0.36 - sq;
+  g.beginPath();
+  g.moveTo(-bw / 2, 0); g.lineTo(-bw / 2, -bh + s * 0.06); g.quadraticCurveTo(-bw / 2, -bh, -bw / 2 + s * 0.06, -bh);
+  g.lineTo(bw / 2 - s * 0.06, -bh); g.quadraticCurveTo(bw / 2, -bh, bw / 2, -bh + s * 0.06); g.lineTo(bw / 2, 0); g.closePath();
+  if (k.shirt === 'stripe'){
+    g.fillStyle = COL.W; g.fill();
+    g.save(); g.clip(); g.fillStyle = COL.K;
+    g.fillRect(-bw, -bh * 0.72, bw * 2, bh * 0.16); g.fillRect(-bw, -bh * 0.36, bw * 2, bh * 0.16);
+    g.restore();
+  } else { g.fillStyle = k.shirt; g.fill(); }
+  g.lineWidth = Math.max(2.5, s * 0.035); g.stroke();
+  g.restore();
+  const sh = rotP(hip.x, hip.y, 0, -bh + s * 0.03, lean);
+  const shL = rotP(hip.x, hip.y, -bw / 2 + s * 0.02, -bh + s * 0.05, lean);
+  const shR2 = rotP(hip.x, hip.y, bw / 2 - s * 0.02, -bh + s * 0.05, lean);
+  const head = rotP(hip.x, hip.y, 0, -bh - s * 0.15, lean);
+  // 手の位置（姿勢で気持ちを伝える）
+  let hl, hr;
+  const holding = (k.role === 'hold' || k.role === 'stage') && phase !== 'fold';
+  if (holding){
+    let tgt = kidHand(k);
+    if (k.role === 'stage' || (phase === 'toStage' && k.id === holder)){
+      tgt = { x:lerp(tgt.x, handle.x, 0.85), y:lerp(tgt.y, handle.y + kh * 0.1, 0.85) };
+      const dd = dist(tgt.x, tgt.y, sh.x, sh.y), mx = s * 0.75;
+      if (dd > mx){ tgt = { x:sh.x + (tgt.x - sh.x) / dd * mx, y:sh.y + (tgt.y - sh.y) / dd * mx }; }
+    }
+    hl = { x:tgt.x - s * 0.06, y:tgt.y + s * 0.02 }; hr = { x:tgt.x + s * 0.06, y:tgt.y + s * 0.02 };
+  } else if (k.cheer > 0.3 || (phase === 'fold' && k.jump > 0)){
+    hl = { x:shL.x - s * 0.22, y:shL.y - s * 0.3 }; hr = { x:shR2.x + s * 0.22, y:shR2.y - s * 0.3 };
+  } else if (k.role === 'wait'){
+    const dx = handle.x - sh.x, dy = handle.y - sh.y, dl = Math.hypot(dx, dy) || 1;
+    const ext = s * (0.34 + 0.16 * k.reach);
+    const ux = dx / dl, uy = Math.min(dy / dl, 0.2) - 0.35 - 0.3 * k.reach;
+    const ul = Math.hypot(ux, uy) || 1;
+    const wav = Math.sin(t * 3 + k.seed) * s * 0.02;
+    hl = { x:shL.x + ux / ul * ext, y:shL.y + uy / ul * ext + wav }; hr = { x:shR2.x + ux / ul * ext, y:shR2.y + uy / ul * ext - wav };
+  } else if (sit && k.clapT < 0.1){
+    const kb = k.kneeT * s * 0.05;
+    hl = { x:hip.x - s * 0.12, y:hip.y + s * 0.02 - kb }; hr = { x:hip.x + s * 0.12, y:hip.y + s * 0.02 - kb };
+  } else {
+    const ap = s * (0.02 + 0.12 * (1 - k.clapT));
+    const cy = sh.y + s * 0.1;
+    hl = { x:sh.x - ap, y:cy }; hr = { x:sh.x + ap, y:cy };
+  }
+  // 腕
+  g.lineWidth = lw * 0.85; g.strokeStyle = COL.K;
+  g.beginPath(); g.moveTo(shL.x, shL.y); g.lineTo(hl.x, hl.y); g.moveTo(shR2.x, shR2.y); g.lineTo(hr.x, hr.y); g.stroke();
+  // 頭（顔は描かない）
+  const hrr = s * 0.13;
+  g.fillStyle = COL.W; g.beginPath(); g.arc(head.x, head.y, hrr, 0, Math.PI * 2); g.fill();
+  g.lineWidth = Math.max(2.5, s * 0.035); g.stroke();
+  g.fillStyle = COL.K;
+  g.save(); g.translate(head.x, head.y); g.rotate(lean);
+  g.beginPath(); g.arc(0, 0, hrr, Math.PI * 1.02, Math.PI * 1.98); g.closePath(); g.fill();
+  if (k.id === 0){ g.fillRect(-hrr * 1.05, -hrr * 0.2, hrr * 0.4, hrr * 0.9); g.fillRect(hrr * 0.65, -hrr * 0.2, hrr * 0.4, hrr * 0.9); }
+  else if (k.id === 1){ g.beginPath(); g.arc(-hrr * 0.95, -hrr * 0.55, hrr * 0.32, 0, Math.PI * 2); g.arc(hrr * 0.95, -hrr * 0.55, hrr * 0.32, 0, Math.PI * 2); g.fill(); }
+  else { g.beginPath(); g.moveTo(hrr * 0.6, -hrr * 0.7); g.lineTo(hrr * 1.5, -hrr * 0.2); g.lineTo(hrr * 0.85, hrr * 0.05); g.closePath(); g.fill(); }
+  g.restore();
+  // 手
+  for (const h of [hl, hr]){
+    g.fillStyle = COL.W; g.beginPath(); g.arc(h.x, h.y, s * 0.055, 0, Math.PI * 2); g.fill();
+    g.lineWidth = Math.max(2, s * 0.028); g.strokeStyle = COL.K; g.stroke();
+  }
+  // 受け手の印（引いて近づけた時だけ）
+  if (k.reach > 0.05){
+    const h = kidHand(k);
+    g.lineWidth = s * 0.06 * k.reach; g.strokeStyle = COL.K;
+    g.beginPath(); g.arc(h.x, h.y - s * 0.12, s * (0.24 + 0.03 * Math.sin(t * 12)), 0, Math.PI * 2); g.stroke();
+    g.lineWidth = s * 0.035 * k.reach; g.strokeStyle = COL.Y; g.stroke();
+  }
+}
+function drawHandle(t){
+  const st = (phase === 'stage' || phase === 'finale');
+  const sq = Math.max(handle.squash, demo.press * 0.4);
+  const hop = Math.sin(handle.hop * Math.PI) * kh * 0.18;
+  const idleHop = canGrab() && !handle.drag ? Math.max(0, Math.sin(t * 4.2)) * kh * 0.05 : 0;
+  const x = handle.x, y = handle.y - hop - idleHop;
+  const w = kh * 0.62 * (1 + 0.28 * sq), h = kh * 0.22 * (1 - 0.38 * sq);
+  if (canGrab() && !handle.drag){
+    const pr = grabR * (0.95 + 0.12 * Math.sin(t * 5));
+    g.lineWidth = kh * 0.07; g.strokeStyle = COL.K; g.beginPath(); g.arc(x, y, pr, 0, Math.PI * 2); g.stroke();
+    g.lineWidth = kh * 0.04; g.strokeStyle = (Math.sin(t * 5) > 0) ? COL.Y : COL.R; g.stroke();
+  }
+  g.fillStyle = st ? COL.R : COL.Y;
+  const r = h / 2;
+  g.beginPath();
+  g.moveTo(x - w / 2 + r, y - h / 2); g.lineTo(x + w / 2 - r, y - h / 2); g.arc(x + w / 2 - r, y, r, -Math.PI / 2, Math.PI / 2);
+  g.lineTo(x - w / 2 + r, y + h / 2); g.arc(x - w / 2 + r, y, r, Math.PI / 2, Math.PI * 1.5); g.closePath();
+  g.fill(); g.lineWidth = Math.max(3, kh * 0.04); g.strokeStyle = COL.K; g.stroke();
+  g.fillStyle = st ? COL.Y : COL.R;
+  g.beginPath(); g.arc(x - w / 2 + r, y, r * 0.55, 0, Math.PI * 2); g.arc(x + w / 2 - r, y, r * 0.55, 0, Math.PI * 2); g.fill();
+  g.fillStyle = COL.K; g.fillRect(x - kh * 0.02, y - h / 2, kh * 0.04, h);
+}
+function drawDemoHand(){
+  if (!demo.active) return;
+  const s = kh, x = demo.x + s * 0.08, y = demo.y + s * 0.12;
+  const lw = Math.max(2.5, s * 0.035);
+  g.fillStyle = COL.W; g.strokeStyle = COL.K; g.lineWidth = lw; g.lineJoin = 'round';
+  g.beginPath(); g.moveTo(x - s * 0.04, y - s * 0.02); g.lineTo(x - s * 0.04, y - s * 0.24); g.arc(x, y - s * 0.24, s * 0.04, Math.PI, 0); g.lineTo(x + s * 0.04, y); g.closePath(); g.fill(); g.stroke();
+  g.beginPath(); g.moveTo(x - s * 0.1, y); g.lineTo(x + s * 0.16, y); g.lineTo(x + s * 0.16, y + s * 0.18); g.quadraticCurveTo(x + s * 0.03, y + s * 0.3, x - s * 0.1, y + s * 0.18); g.closePath(); g.fill(); g.stroke();
+  if (demo.press){ g.lineWidth = s * 0.04; g.beginPath(); g.arc(x, y - s * 0.27, s * 0.12, 0, Math.PI * 2); g.stroke(); }
+}
+function render(t){
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  drawBackground();
+  drawShade();
+  for (const b of benches) drawBench(b);
+  drawPole();
+  drawStakes();
+  drawRoof(t);
+  const ks = kids.slice().sort((a, b) => a.pos.y - b.pos.y);
+  for (const k of ks) drawKid(k, t);
+  drawHandle(t);
+  for (const r of rings){
+    const p = r.t / r.dur, rr = lerp(r.r0, r.r1, Math.sqrt(p)), lw = r.lw * (1 - p);
+    if (lw < 0.5) continue;
+    if (r.c === COL.Y){ g.lineWidth = lw + 3; g.strokeStyle = COL.K; g.beginPath(); g.arc(r.x, r.y, rr, 0, Math.PI * 2); g.stroke(); }
+    g.lineWidth = lw; g.strokeStyle = r.c; g.beginPath(); g.arc(r.x, r.y, rr, 0, Math.PI * 2); g.stroke();
+  }
+  for (const p of parts){
+    const sc = p.s * (1 - p.t / p.life);
+    g.save(); g.translate(p.x, p.y); g.rotate(p.rot); g.fillStyle = p.c; g.fillRect(-sc, -sc, sc * 2, sc * 2); g.restore();
+  }
+  drawDemoHand();
+}
+
+// ---------------------------------------------------------------- ループ
+let raf = 0, lastT = nowP(), running = false;
+function frame(){
+  raf = 0;
+  if (!running) return;
+  const t = nowP(), dt = Math.min(0.05, Math.max(0, t - lastT)); lastT = t;
+  try { update(dt, t); render(t); } catch(err){ console.warn(err); }
+  raf = requestAnimationFrame(frame);
+}
+function start(){ if (running) return; running = true; lastT = nowP(); nextStepTime = Math.max(nextStepTime, nowP() + 0.05); raf = requestAnimationFrame(frame); }
+function stop(){ running = false; if (raf) cancelAnimationFrame(raf); raf = 0; }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden){
+    if (activePid !== null) releaseDrag(true);
+    stop();
+    if (AC && AC.state === 'running'){ try { AC.suspend().catch(()=>{}); } catch(e){} }
+  } else {
+    vq.length = 0; nextStepTime = nowP() + 0.05;
+    if (AC && AC.state !== 'running'){ try { AC.resume().catch(()=>{}); } catch(e){} }
+    lastInput = nowP();
+    start();
+  }
+});
+window.addEventListener('resize', layout);
+window.addEventListener('orientationchange', () => setTimeout(layout, 120));
+
+// テスト用の読み取り口（ゲームの進行には使わない）
+window.__gf = {
+  state(){ return {
+    phase, holder, order:order.slice(), corners:corners.map(c => c.kind + (c.spot ? ':' + c.spot : '')), cycle, stageHits,
+    handle:{ x:handle.x, y:handle.y, drag:handle.drag, squash:handle.squash }, rest:handleRest(),
+    kids:kids.map(k => ({ role:k.role, spot:k.spot, sitting:k.sitting, x:k.pos.x, y:k.pos.y, hand:kidHand(k), stomps:k.stomps.map(s => s.s), claps:k.clapSteps.slice() })),
+    benches:benches.map(b => ({ shaded:b.shaded, pos:spotFeet(b.id) })), opening, keyRoot, musicOn, memory:JSON.parse(JSON.stringify(memory)),
+    audio: AC ? AC.state : 'none', voices, parts:parts.length, rings:rings.length, demo:demo.active, kh, firstTouchDone, canGrab:canGrab()
+  }; }
+};
+
+layout();
+for (const k of kids){ const f = spotFeet(k.spot); k.pos.x = f.x; k.pos.y = f.y; }
+handle.x = Lp.hook.x; handle.y = Lp.hook.y;
+start();
+})();
+</script>
+</body>
+</html>
